@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import heapq
 import json
+import math
 import random
 import struct
 import zlib
@@ -53,6 +54,31 @@ _SMALL_GEOMETRY_EXTENT_PX = 5.5
 def feature_priority(wkb_bytes: bytes) -> int:
     """Deterministic, geometry-intrinsic sampling priority for a feature."""
     return zlib.crc32(wkb_bytes)
+
+
+def _prefix_conditional_entropy(values: list[str], prefix_len: int) -> float:
+    """Conditional entropy H(value | value[:prefix_len]) in bits.
+
+    Zero when every prefix uniquely identifies its source value — no information
+    lost by truncation. Grows as more distinct values collapse into the same
+    prefix bucket.
+    """
+    if not values:
+        return 0.0
+    buckets: dict[str, dict[str, int]] = {}
+    for v in values:
+        t = v[:prefix_len]
+        if t not in buckets:
+            buckets[t] = {}
+        buckets[t][v] = buckets[t].get(v, 0) + 1
+    n = len(values)
+    h = 0.0
+    for inner in buckets.values():
+        bucket_n = sum(inner.values())
+        q_t = bucket_n / n
+        h_given_t = sum(-c / bucket_n * math.log2(c / bucket_n) for c in inner.values())
+        h += q_t * h_given_t
+    return h
 
 
 @dataclass(frozen=True)
@@ -270,39 +296,46 @@ class IntermediateVectorTile:
             self._seq += 1
             heapq.heappush(self._heap, entry)
 
-    def triage(self, n_bins: int = 10) -> None:
-        """Apply numeric quantization triage.
+    def triage(self, n_bins: int = 10, kld_threshold: float = 0.1) -> None:
+        """Apply numeric quantization and string prefix triage (HiFIVE §6.2).
 
-        For each int/float property across all retained features, divides the
-        value range into n_bins equal-width bins and replaces every value with
-        its bin midpoint. This reduces the number of distinct values in the MVT
-        property dictionary — fewer dictionary entries → smaller encoded tile —
-        without dropping any features or changing their geometries.
+        Numeric (§6.2.1): for each int/float property, divides the value range
+        into n_bins equal-width bins and replaces each value with its bin midpoint.
 
-        Call this after all add_feature() calls and before encode().
+        String (§6.2.2): for each string property, finds the shortest prefix
+        length L such that the conditional entropy H(value | value[:L]) is at or
+        below kld_threshold bits. Replaces all values with their length-L prefix.
+        kld_threshold=0 requires that every prefix still uniquely identifies its
+        original value (zero collisions); higher values allow more merging.
+
+        Both steps reduce distinct values in the MVT property dictionary without
+        dropping features or changing geometries. Call after add_feature() and
+        before encode().
         """
         if not self._heap:
             return
 
-        # Step 1: collect all values for each numeric column across the heap
+        # ------------------------------------------------------------------
+        # Step 1: collect column values for numeric and string columns
+        # ------------------------------------------------------------------
         numeric_cols: dict[str, list[float]] = {}
+        string_cols: dict[str, list[str]] = {}
         for _, _, feature in self._heap:
             for key, value in feature.properties.items():
-                # bool is a subclass of int in Python — exclude it explicitly
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     numeric_cols.setdefault(key, []).append(float(value))
+                elif isinstance(value, str):
+                    string_cols.setdefault(key, []).append(value)
 
-        if not numeric_cols:
-            return
-
-        # Step 2: compute equal-width bin boundaries and midpoints per column
+        # ------------------------------------------------------------------
+        # Step 2: numeric — compute equal-width bin midpoints per column
+        # ------------------------------------------------------------------
         bin_midpoints: dict[str, list[float]] = {}
         bin_mins: dict[str, float] = {}
         bin_steps: dict[str, float] = {}
         for col, values in numeric_cols.items():
             lo, hi = min(values), max(values)
             if lo == hi:
-                # All values identical — one bin, midpoint is the value itself
                 bin_midpoints[col] = [lo]
                 bin_mins[col] = lo
                 bin_steps[col] = 1.0
@@ -312,22 +345,48 @@ class IntermediateVectorTile:
                 bin_mins[col] = lo
                 bin_steps[col] = step
 
-        # Step 3: rebuild the heap with quantized property values
-        # _TileFeature is frozen so we create a new instance per feature
+        # ------------------------------------------------------------------
+        # Step 3: string — find shortest prefix length with entropy <= threshold
+        # ------------------------------------------------------------------
+        # string_replacements[col] = {original_value: truncated_value}
+        string_replacements: dict[str, dict[str, str]] = {}
+        for col, values in string_cols.items():
+            unique_vals = set(values)
+            if len(unique_vals) <= 1:
+                continue
+            max_len = max(len(v) for v in unique_vals)
+            for prefix_len in range(1, max_len + 1):
+                if _prefix_conditional_entropy(values, prefix_len) <= kld_threshold:
+                    if prefix_len < max_len:
+                        # At least one value is shortened — worth applying
+                        string_replacements[col] = {v: v[:prefix_len] for v in unique_vals}
+                    break
+
+        if not bin_midpoints and not string_replacements:
+            return
+
+        # ------------------------------------------------------------------
+        # Step 4: rebuild heap with quantized / truncated property values
+        # _TileFeature is frozen so new instances must be created
+        # ------------------------------------------------------------------
         new_heap: list[tuple[int, int, _TileFeature]] = []
         for priority, seq, feature in self._heap:
             new_props = dict(feature.properties)
+
             for col, midpoints in bin_midpoints.items():
                 if col not in new_props:
                     continue
                 value = float(new_props[col])
                 lo = bin_mins[col]
                 step = bin_steps[col]
-                # Which bin does this value fall into?
                 bin_idx = int((value - lo) / step)
-                # Clamp — the maximum value lands exactly on the upper edge
                 bin_idx = max(0, min(len(midpoints) - 1, bin_idx))
                 new_props[col] = midpoints[bin_idx]
+
+            for col, replacements in string_replacements.items():
+                if col in new_props and isinstance(new_props[col], str):
+                    new_props[col] = replacements.get(new_props[col], new_props[col])
+
             new_heap.append((priority, seq, _TileFeature(feature.geometry, new_props)))
 
         self._heap = new_heap

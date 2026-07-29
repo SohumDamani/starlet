@@ -379,8 +379,14 @@ def generate_single_mvt_tile(
     extent: int | None = None,
     buffer: int | None = None,
     layer_name: str = "layer0",
+    triage: bool = False,
 ) -> bytes:
-    """Generate one MVT tile directly from an indexed Starlet dataset."""
+    """Generate one MVT tile directly from an indexed Starlet dataset.
+
+    When ``triage=True``, applies numeric quantization and string prefix triage
+    (HiFIVE §6.2) before encoding. This reduces tile size without dropping any
+    features. Defaults to ``False`` so existing callers are unaffected.
+    """
     feature_capacity = int(
         feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
     )
@@ -420,6 +426,9 @@ def generate_single_mvt_tile(
 
     for geom, attrs, priority in sampled_features:
         tile.add_feature(geom, attrs, priority=priority)
+
+    if triage:
+        tile.triage()
 
     return tile.encode(layer_name=layer_name)
 

@@ -107,12 +107,14 @@ def run_capacity(
     y: int,
     capacity: int,
     use_triage: bool = False,
+    kld_threshold: float = 0.1,
 ) -> dict:
     """Feed all features to an IVT at the given capacity; encode and time it.
 
     The IVT heap naturally caps at `capacity` (top-k by priority), so every
     capacity level sees the same features but keeps a different number of them.
-    If use_triage=True, calls triage() between add_feature and encode.
+    If use_triage=True, calls triage() between add_feature and encode, applying
+    both numeric quantization and string prefix triage.
     """
     tile = IntermediateVectorTile(z, x, y, feature_capacity=capacity)
 
@@ -122,7 +124,7 @@ def run_capacity(
     add_time = time.perf_counter() - t0
 
     if use_triage:
-        tile.triage()
+        tile.triage(kld_threshold=kld_threshold)
 
     t0 = time.perf_counter()
     mvt_bytes = tile.encode()
@@ -227,6 +229,12 @@ def main() -> None:
         help=f"Capacities to test (default: {CAPACITIES})",
     )
     parser.add_argument(
+        "--kld-threshold",
+        type=float,
+        default=0.1,
+        help="Conditional-entropy threshold (bits) for string prefix triage (default: 0.1)",
+    )
+    parser.add_argument(
         "--output",
         default=str(SCRIPT_DIR / "results" / "capacity_scaling.json"),
         help="Path to write JSON results",
@@ -263,7 +271,7 @@ def main() -> None:
         print(f"encode={r['encode_time_s']:.3f}s  size={r['tile_kb']:.2f}KB")
 
         print(f"Running capacity={cap:,} [triage] ...", end=" ", flush=True)
-        t = run_capacity(features, z, x, y, cap, use_triage=True)
+        t = run_capacity(features, z, x, y, cap, use_triage=True, kld_threshold=args.kld_threshold)
         triage_results.append(t)
         print(f"encode={t['encode_time_s']:.3f}s  size={t['tile_kb']:.2f}KB")
 
