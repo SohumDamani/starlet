@@ -33,6 +33,7 @@ from starlet._internal.mvt.helpers import (
 )
 from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile, feature_priority
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
+from starlet._internal.mvt.tile_format import TILE_GZIP
 from starlet._internal.pmtiles.paths import default_pmtiles_path
 from starlet._internal.pmtiles.exporter import export_to_pmtiles
 from starlet._internal.server.tiler.parquet_index import INTERNAL_COLS, ParquetIndex
@@ -51,6 +52,7 @@ _INTERNAL_ATTRIBUTE_COLUMNS = {
 _SINGLE_TILE_INDEX_CACHE_SIZE = 16
 _single_tile_index_cache: "OrderedDict[str, ParquetIndex]" = OrderedDict()
 _REDUCE_GROUP_SIZE = 10
+
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,7 @@ class DatasetMVTGenerator:
         geom_col: str = "geometry",
         seed: int = 42,
         temp_dir: str | None = None,
+        tile_gzip: bool | None = None,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.parquet_dir = self.dataset_dir / "parquet_tiles"
@@ -127,6 +130,7 @@ class DatasetMVTGenerator:
         self.geom_col = geom_col
         self.seed = int(seed)
         self.temp_dir = temp_dir
+        self.tile_gzip = TILE_GZIP if tile_gzip is None else bool(tile_gzip)
 
         if self.num_zoom_levels <= 0:
             raise ValueError("num_zoom_levels must be positive")
@@ -239,6 +243,7 @@ class DatasetMVTGenerator:
                     self.feature_capacity,
                     self.extent,
                     self.buffer,
+                    self.tile_gzip,
                 )
                 for group in reduce_groups
                 if group
@@ -324,7 +329,9 @@ def _reduce_tile_group(
     feature_capacity: int,
     extent: int,
     buffer: int,
+    tile_gzip: bool = TILE_GZIP,
 ) -> None:
+    import gzip as _gzip
     out_path = Path(outdir)
     for reduce_input in reduce_inputs:
         tile_id = reduce_input.tile_id
@@ -363,8 +370,13 @@ def _reduce_tile_group(
             continue
         x_dir = out_path / str(z) / str(x)
         x_dir.mkdir(parents=True, exist_ok=True)
-        with open(x_dir / f"{y}.mvt", "wb") as output:
-            output.write(merged.encode())
+        mvt_bytes = merged.encode()
+        if tile_gzip:
+            filename, data = f"{y}.mvt.gz", _gzip.compress(mvt_bytes, compresslevel=6)
+        else:
+            filename, data = f"{y}.mvt", mvt_bytes
+        with open(x_dir / filename, "wb") as output:
+            output.write(data)
 
 
 def _intermediate_tile_filename(z: int, x: int, y: int) -> str:
@@ -746,7 +758,8 @@ def _discover_tile_counts_by_zoom(outdir: Path) -> list[int]:
         if not child.is_dir() or not child.name.isdigit():
             continue
         zoom = int(child.name)
-        counts[zoom] = len(list(child.rglob("*.mvt")))
+        gz_count = len(list(child.rglob("*.mvt.gz")))
+        counts[zoom] = gz_count if gz_count > 0 else len(list(child.rglob("*.mvt")))
     if not counts:
         return []
     return [counts.get(z, 0) for z in range(max(counts) + 1)]

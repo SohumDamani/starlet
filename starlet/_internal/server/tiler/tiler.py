@@ -5,6 +5,7 @@ from typing import Any, MutableMapping
 import gzip
 
 from starlet._internal.config import config_value
+from starlet._internal.mvt.tile_format import TILE_GZIP
 from starlet._internal.pmtiles.paths import discover_pmtiles_path
 
 from .tile_cache import TileCache
@@ -56,6 +57,9 @@ class VectorTiler:
         self.cache = TileCache(int(cache_size))
 
     def tile_path(self, z: int, x: int, y: int) -> Path:
+        gz = self.mvt_dir / str(z) / str(x) / f"{y}.mvt.gz"
+        if gz.exists():
+            return gz
         return self.mvt_dir / str(z) / str(x) / f"{y}.mvt"
 
     def _pmtiles_tile(self, z: int, x: int, y: int) -> bytes | None:
@@ -84,6 +88,7 @@ class VectorTiler:
                 output,
                 generation="mem-cache",
                 elapsed_ms=(perf_counter() - t0) * 1000,
+                gzip_compressed=TILE_GZIP,
             )
             return cached
 
@@ -114,6 +119,7 @@ class VectorTiler:
                 generation="read_from_disk",
                 path=str(path),
                 elapsed_ms=elapsed_ms,
+                gzip_compressed=path.suffix == ".gz",
             )
             return data
 
@@ -128,6 +134,9 @@ class VectorTiler:
             extent=self.extent,
             buffer=self.buffer,
         )
+        is_gzip = TILE_GZIP
+        if is_gzip:
+            tile_bytes = gzip.compress(tile_bytes, compresslevel=6)
         _update_output(
             output,
             source="generated",
@@ -136,6 +145,7 @@ class VectorTiler:
             extent=self.extent,
             buffer=self.buffer,
             elapsed_ms=(perf_counter() - t0) * 1000,
+            gzip_compressed=is_gzip,
         )
 
         # On-demand tiles are cached in memory only; we deliberately do NOT

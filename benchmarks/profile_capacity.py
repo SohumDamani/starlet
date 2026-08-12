@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
 import time
@@ -36,29 +37,86 @@ from starlet._internal.mvt.mvt_generator import _iter_web_mercator_features
 CAPACITIES = [2_000, 5_000, 10_000]
 DEFAULT_TILE_DIR = PROJECT_ROOT / "benchmark_output_parquet" / "parquet_tiles"
 DEFAULT_MAX_FEATURES = 12_000  # Load this many; must exceed max capacity
+_SAMPLE_SIZE = 15_000          # Features to stream from raw GeoJSON files
+
+_RAW_SUFFIXES = {".geojson", ".gz", ".json"}
 
 
 # ---------------------------------------------------------------------------
 # Feature loading
 # ---------------------------------------------------------------------------
 
+def _geojson_to_parquet(src: Path, out_parquet: Path, max_rows: int) -> None:
+    """Stream up to max_rows features from a GeoJSON or .geojson.gz file and
+    save as a single GeoParquet file using geopandas. Uses ijson for streaming
+    so large files are never fully loaded into memory.
+    """
+    import gzip, ijson, geopandas as gpd
+    from shapely.geometry import shape
+
+    opener = gzip.open if src.name.endswith(".gz") else open
+    rows = []
+    print(f"  Streaming up to {max_rows:,} features from {src.name} ...")
+    with opener(src, "rb") as f:
+        for feature in ijson.items(f, "features.item"):
+            geom = feature.get("geometry")
+            if geom is None:
+                continue
+            props = feature.get("properties") or {}
+            props["geometry"] = shape(geom)
+            rows.append(props)
+            if len(rows) >= max_rows:
+                break
+
+    print(f"  Streamed {len(rows):,} features — converting to GeoParquet ...")
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
+    out_parquet.parent.mkdir(parents=True, exist_ok=True)
+    gdf.to_parquet(out_parquet)
+    print(f"  Saved to {out_parquet.name}")
+
+
+def _ensure_parquet_tiles(path: Path) -> Path:
+    """Return a parquet tile directory ready for _iter_web_mercator_features.
+
+    - If path is already a parquet tile directory, return it as-is.
+    - If path is a raw GeoJSON / .geojson.gz file, stream a sample into a
+      single GeoParquet file (created once, reused on subsequent runs).
+    """
+    if path.is_dir():
+        if (path / "parquet_tiles").exists():
+            return path / "parquet_tiles"
+        return path
+
+    if path.suffix.lower() in _RAW_SUFFIXES or path.name.endswith(".geojson.gz"):
+        stem = path.name.split(".")[0]
+        out_dir = path.parent / (stem + "_parquet")
+        out_parquet = out_dir / f"{stem}_sample.parquet"
+        if out_parquet.exists():
+            print(f"Found existing sample at {out_dir.name}/{out_parquet.name}")
+            return out_dir
+        _geojson_to_parquet(path, out_parquet, _SAMPLE_SIZE)
+        return out_dir
+
+    raise ValueError(f"Cannot determine input type for: {path}")
+
+
 def load_features(tile_dir: Path, max_features: int) -> list[tuple]:
-    """Load up to max_features from parquet tile files, ready for IVT.
+    """Load up to max_features ready for IVT.
+
+    Accepts either:
+    - A parquet tile directory (existing indexed dataset)
+    - A raw GeoJSON / .geojson.gz file (auto-indexed via starlet.tile())
 
     Each element: (mercator_geometry, properties_dict, priority_int).
-
-    Delegates entirely to _iter_web_mercator_features() from the library:
-    - Reads CRS from file metadata (no hardcoded EPSG:4326 assumption)
-    - Reprojects to Web Mercator via the library's reproject_geometries()
-    - Extracts ALL non-geometry, non-internal columns automatically
-    - Computes priority from source WKB bytes (pre-reproject) for
-      seam-consistency with the main pipeline
+    Delegates to _iter_web_mercator_features() for CRS detection,
+    reprojection, column filtering, and priority computation.
     """
-    parquet_files = sorted(tile_dir.glob("*.parquet"))
+    parquet_dir = _ensure_parquet_tiles(tile_dir)
+    parquet_files = sorted(parquet_dir.glob("*.parquet"))
     if not parquet_files:
-        raise FileNotFoundError(f"No .parquet files found in {tile_dir}")
+        raise FileNotFoundError(f"No .parquet files found in {parquet_dir}")
 
-    print(f"Loading from {len(parquet_files)} parquet file(s) in {tile_dir.name}/")
+    print(f"Loading from {len(parquet_files)} parquet file(s) in {parquet_dir.name}/")
     features: list[tuple] = []
 
     for pf_path in parquet_files:
@@ -130,6 +188,8 @@ def run_capacity(
     mvt_bytes = tile.encode()
     encode_time = time.perf_counter() - t0
 
+    gz_bytes = gzip.compress(mvt_bytes, compresslevel=6)
+
     return {
         "capacity": capacity,
         "use_triage": use_triage,
@@ -140,6 +200,8 @@ def run_capacity(
         "total_time_s": round(add_time + encode_time, 3),
         "tile_bytes": len(mvt_bytes),
         "tile_kb": round(len(mvt_bytes) / 1024, 2),
+        "gzip_bytes": len(gz_bytes),
+        "gzip_kb": round(len(gz_bytes) / 1024, 2),
     }
 
 
@@ -198,6 +260,42 @@ def print_triage_comparison(raw: list[dict], triaged: list[dict]) -> None:
             f"  {r['capacity']:<12,} {r['tile_kb']:>10.2f} {t['tile_kb']:>12.2f}"
             f" {saved:>12.2f} {reduction:>9.1f}%"
         )
+    print()
+
+
+def print_four_combo_table(raw: list[dict], triaged: list[dict]) -> None:
+    """Print 4-combination comparison: A=raw, B=gzip, C=triage, D=triage+gzip.
+
+    Both raw and triaged results must already contain gzip_kb (from run_capacity).
+    This lets us answer: does triage still add meaningful reduction on top of gzip?
+    """
+    print("=== 4-Combination Analysis: Triage x Gzip ===")
+    print("  A = raw MVT   (no triage, no gzip)")
+    print("  B = gzip only (no triage, gzip compressed)")
+    print("  C = triage    (triage, no gzip)")
+    print("  D = triage+gz (triage + gzip compressed)")
+    print()
+    header = f"  {'Cap':>6}  {'A (KB)':>8}  {'B (KB)':>8}  {'C (KB)':>8}  {'D (KB)':>8}  {'B vs A':>8}  {'C vs A':>8}  {'D vs A':>8}  {'D vs B':>8}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    def pct(before, after):
+        return f"{(before - after) / before * 100:.1f}%" if before else "n/a"
+
+    for r, t in zip(raw, triaged):
+        a = r["tile_kb"]
+        b = r["gzip_kb"]
+        c = t["tile_kb"]
+        d = t["gzip_kb"]
+        print(
+            f"  {r['capacity']:>6,}  {a:>8.2f}  {b:>8.2f}  {c:>8.2f}  {d:>8.2f}"
+            f"  {pct(a,b):>8}  {pct(a,c):>8}  {pct(a,d):>8}  {pct(b,d):>8}"
+        )
+    print()
+    print("  Column legend:")
+    print("    B vs A = gzip reduction over raw")
+    print("    C vs A = triage reduction over raw")
+    print("    D vs A = triage+gzip reduction over raw (combined)")
+    print("    D vs B = extra saving triage adds ON TOP of gzip alone")
     print()
 
 
@@ -283,11 +381,36 @@ def main() -> None:
     print_table(triage_results, (z, x, y))
 
     print_triage_comparison(raw_results, triage_results)
+    print_four_combo_table(raw_results, triage_results)
+
+    # --- Dataset summary ---
+    src_path = Path(args.tile_dir)
+    src_size_mb = round(src_path.stat().st_size / 1024 / 1024, 1) if src_path.is_file() else "n/a (directory)"
+    print("--- Dataset summary ---")
+    print(f"  Source         : {src_path.name}")
+    print(f"  Source size    : {src_size_mb} MB")
+    print(f"  Sampling       : first {len(features):,} features streamed sequentially from file start")
+    print(f"  Features loaded: {len(features):,} of max={args.max_features:,}")
+    print(f"  Benchmark tile : z={z}, x={x}, y={y}  (zoom-5, centroid of feature pool)")
+    print(f"  Capacities     : {capacities}")
+    print(f"  KLD threshold  : {args.kld_threshold} bits (string triage entropy limit)")
+    best = triage_results[-1]
+    base = raw_results[-1]
+    saved_pct = round((base['tile_kb'] - best['tile_kb']) / base['tile_kb'] * 100, 1) if base['tile_kb'] else 0
+    print(f"  Best reduction : {saved_pct}% at capacity={best['capacity']:,} "
+          f"({base['tile_kb']:.1f} KB -> {best['tile_kb']:.1f} KB)")
+    print()
 
     # --- Save ---
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "dataset": {
+            "source": str(src_path),
+            "source_size_mb": src_size_mb,
+            "sampling": f"first {len(features)} features from file start",
+            "features_loaded": len(features),
+        },
         "tile": {"z": z, "x": x, "y": y},
         "features_in_pool": len(features),
         "raw": raw_results,

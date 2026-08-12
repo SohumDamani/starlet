@@ -1,0 +1,295 @@
+<title>HiFIVE Starlet — Benchmark Report</title>
+<style>
+  :root {
+    --bg:#f4f5f8;--surface:#ffffff;--border:#dde1ea;--text:#1a1d2e;--muted:#6b7280;
+    --accent:#2563eb;--green:#16a34a;--amber:#b45309;--red:#dc2626;
+    --mono:'Courier New','Consolas',monospace;--serif:Georgia,'Times New Roman',serif;--sans:system-ui,-apple-system,sans-serif;
+  }
+  @media(prefers-color-scheme:dark){:root{--bg:#0d1117;--surface:#161b27;--border:#262d3f;--text:#e2e8f0;--muted:#8892a4;--accent:#4c8bf5;--green:#3dba7e;--amber:#f0a030;--red:#f06060;}}
+  :root[data-theme="dark"]{--bg:#0d1117;--surface:#161b27;--border:#262d3f;--text:#e2e8f0;--muted:#8892a4;--accent:#4c8bf5;--green:#3dba7e;--amber:#f0a030;--red:#f06060;}
+  :root[data-theme="light"]{--bg:#f4f5f8;--surface:#ffffff;--border:#dde1ea;--text:#1a1d2e;--muted:#6b7280;--accent:#2563eb;--green:#16a34a;--amber:#b45309;--red:#dc2626;}
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.6;padding:2rem 1rem 4rem;}
+  .page{max-width:920px;margin:0 auto;}
+  .report-header{border-bottom:2px solid var(--accent);padding-bottom:1.5rem;margin-bottom:2rem;}
+  .report-header .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin-bottom:.5rem;}
+  .report-header h1{font-family:var(--serif);font-size:2rem;font-weight:normal;color:var(--text);line-height:1.25;margin-bottom:.4rem;}
+  .report-header .meta{font-size:13px;color:var(--muted);font-family:var(--mono);}
+  .stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:2.5rem;}
+  .stat-tile{background:var(--surface);border:1px solid var(--border);border-top:3px solid var(--accent);padding:1rem 1.2rem;}
+  .stat-tile .label{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:.4rem;font-family:var(--mono);}
+  .stat-tile .value{font-family:var(--mono);font-size:1.8rem;font-weight:bold;color:var(--accent);line-height:1;}
+  .stat-tile .sub{font-size:12px;color:var(--muted);margin-top:.3rem;}
+  .section{margin-bottom:3rem;}
+  .section-header{display:flex;align-items:baseline;gap:.8rem;border-left:4px solid var(--accent);padding-left:.8rem;margin-bottom:1.25rem;}
+  .section-header h2{font-family:var(--serif);font-size:1.3rem;font-weight:normal;color:var(--text);}
+  .section-header .section-tag{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase;}
+  .subsection{margin-bottom:2rem;}
+  .subsection h3{font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);margin-bottom:.75rem;padding-bottom:.35rem;border-bottom:1px solid var(--border);}
+  .tbl-wrap{overflow-x:auto;}
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;}
+  th{background:var(--surface);border:1px solid var(--border);padding:.5rem .75rem;text-align:right;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);white-space:nowrap;}
+  th:first-child{text-align:left;}
+  td{border:1px solid var(--border);padding:.45rem .75rem;text-align:right;white-space:nowrap;}
+  td:first-child{text-align:left;color:var(--muted);}
+  tr:nth-child(even) td{background:var(--surface);}
+  tr:nth-child(odd) td{background:var(--bg);}
+  .pct-hi{color:var(--green);font-weight:bold;}
+  .pct-mid{color:var(--amber);}
+  .pct-lo{color:var(--muted);}
+  .col-d{color:var(--accent);font-weight:bold;}
+  .combo-legend{display:flex;flex-wrap:wrap;gap:.6rem 1.5rem;margin-bottom:1rem;font-family:var(--mono);font-size:12px;}
+  .combo-legend span{color:var(--muted);}
+  .combo-legend strong{color:var(--text);}
+  .findings{display:flex;flex-direction:column;gap:.75rem;}
+  .finding{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--green);padding:.8rem 1rem;font-size:14px;line-height:1.5;}
+  .finding.note{border-left-color:var(--amber);}
+  .finding .finding-label{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:.3rem;}
+  .pipeline{display:flex;align-items:center;flex-wrap:wrap;gap:0;margin-bottom:1rem;}
+  .pipe-step{background:var(--surface);border:1px solid var(--border);padding:.5rem .9rem;font-family:var(--mono);font-size:12px;color:var(--text);}
+  .pipe-arrow{font-family:var(--mono);font-size:14px;color:var(--accent);padding:0 .3rem;}
+  .pipe-ok{font-family:var(--mono);font-size:11px;color:var(--green);font-weight:bold;padding:0 .4rem;}
+  .server-log{background:var(--surface);border:1px solid var(--border);padding:.8rem 1rem;font-family:var(--mono);font-size:12px;color:var(--muted);overflow-x:auto;line-height:1.7;}
+  .server-log .hi{color:var(--green);font-weight:bold;}
+  .server-log .dim{color:var(--border);}
+  .report-footer{margin-top:3rem;border-top:1px solid var(--border);padding-top:1rem;font-family:var(--mono);font-size:11px;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem;}
+</style>
+
+<div class="page">
+  <header class="report-header">
+    <div class="eyebrow">HiFIVE §6.2.1 / §6.2.2 · Starlet MVT Pipeline</div>
+    <h1>Benchmark Report: Triage &amp; Gzip Compression</h1>
+    <div class="meta">Run date: 2026-08-05 &nbsp;·&nbsp; Branch: triage-implementation &nbsp;·&nbsp; Datasets: TIGER2017/BG, TIGER2017/TRACT, eBird &nbsp;·&nbsp; Capacities: 2k / 5k / 10k</div>
+  </header>
+
+  <div class="stat-row">
+    <div class="stat-tile"><div class="label">Datasets tested</div><div class="value">3</div><div class="sub">BG · TRACT · eBird</div></div>
+    <div class="stat-tile"><div class="label">Best triage reduction</div><div class="value">16.1%</div><div class="sub">TIGER2017/BG @ cap 5k</div></div>
+    <div class="stat-tile"><div class="label">Best gzip reduction</div><div class="value">69.6%</div><div class="sub">eBird @ cap 10k vs raw</div></div>
+    <div class="stat-tile"><div class="label">Triage on top of gzip</div><div class="value">14–26%</div><div class="sub">Extra saving (D vs B), all datasets</div></div>
+    <div class="stat-tile"><div class="label">eBird features</div><div class="value">500k</div><div class="sub">42 attribute columns</div></div>
+  </div>
+
+  <!-- SECTION 1 — TRIAGE -->
+  <section class="section">
+    <div class="section-header"><h2>Triage Benchmarks — Numeric Quantization &amp; String Triage</h2><span class="section-tag">HiFIVE §6.2.1 + §6.2.2</span></div>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:1.25rem;">Each run feeds 12,000 features into an IntermediateVectorTile at three capacity levels. triage(kld_threshold=0.1) applies equal-width numeric binning (§6.2.1) followed by string prefix entropy pruning (§6.2.2) before encoding. Sizes are uncompressed MVT bytes.</p>
+
+    <div class="subsection">
+      <h3>TIGER2017 / BG — Block Groups (2,106 MB source · 98.7 MB parquet)</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Capacity</th><th>Retained</th><th>Raw (KB)</th><th>Triage (KB)</th><th>Saved (KB)</th><th>Reduction</th><th>Encode (s)</th></tr></thead>
+        <tbody>
+          <tr><td>2,000</td><td>2,000</td><td>231.68</td><td>198.72</td><td>32.96</td><td class="pct-mid">14.2%</td><td>0.261</td></tr>
+          <tr><td>5,000</td><td>5,000</td><td>576.44</td><td>483.84</td><td>92.60</td><td class="pct-hi">16.1%</td><td>0.644</td></tr>
+          <tr><td>10,000</td><td>10,000</td><td>1,155.19</td><td>995.10</td><td>160.09</td><td class="pct-mid">13.9%</td><td>1.299</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="subsection">
+      <h3>TIGER2017 / TRACT — Census Tracts (1,177 MB source · 114 MB parquet)</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Capacity</th><th>Retained</th><th>Raw (KB)</th><th>Triage (KB)</th><th>Saved (KB)</th><th>Reduction</th><th>Encode (s)</th></tr></thead>
+        <tbody>
+          <tr><td>2,000</td><td>2,000</td><td>19.37</td><td>17.40</td><td>1.97</td><td class="pct-mid">10.2%</td><td>0.159</td></tr>
+          <tr><td>5,000</td><td>5,000</td><td>42.10</td><td>37.80</td><td>4.30</td><td class="pct-mid">10.2%</td><td>0.381</td></tr>
+          <tr><td>10,000</td><td>10,000</td><td>83.22</td><td>76.08</td><td>7.14</td><td class="pct-lo">8.6%</td><td>0.710</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <!-- SECTION 2 — 4-COMBO -->
+  <section class="section">
+    <div class="section-header"><h2>Four-Combination Analysis — Triage × Gzip</h2><span class="section-tag">Core Research Question</span></div>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:1rem;">Tests whether triage still reduces tile size meaningfully when gzip is already applied. Gzip uses compresslevel=6, matching the live server pipeline.</p>
+    <div class="combo-legend">
+      <div><strong>A</strong> <span>= raw MVT (no triage, no gzip)</span></div>
+      <div><strong>B</strong> <span>= gzip only</span></div>
+      <div><strong>C</strong> <span>= triage only</span></div>
+      <div><strong style="color:var(--accent)">D</strong> <span>= triage + gzip &nbsp;<em>(pipeline default)</em></span></div>
+    </div>
+
+    <div class="subsection">
+      <h3>TIGER2017 / BG</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Cap</th><th>A Raw (KB)</th><th>B Gzip (KB)</th><th>C Triage (KB)</th><th>D Triage+Gz (KB)</th><th>B vs A</th><th>C vs A</th><th>D vs A</th><th>D vs B ★</th></tr></thead>
+        <tbody>
+          <tr><td>2,000</td><td>231.68</td><td>122.44</td><td>198.72</td><td class="col-d">92.46</td><td class="pct-hi">47.2%</td><td class="pct-mid">14.2%</td><td class="pct-hi">60.1%</td><td class="pct-hi">24.5%</td></tr>
+          <tr><td>5,000</td><td>576.44</td><td>304.00</td><td>483.84</td><td class="col-d">223.96</td><td class="pct-hi">47.3%</td><td class="pct-hi">16.1%</td><td class="pct-hi">61.1%</td><td class="pct-hi">26.3%</td></tr>
+          <tr><td>10,000</td><td>1,155.19</td><td>597.88</td><td>995.10</td><td class="col-d">450.89</td><td class="pct-hi">48.2%</td><td class="pct-mid">13.9%</td><td class="pct-hi">61.0%</td><td class="pct-hi">24.6%</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="subsection">
+      <h3>TIGER2017 / TRACT</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Cap</th><th>A Raw (KB)</th><th>B Gzip (KB)</th><th>C Triage (KB)</th><th>D Triage+Gz (KB)</th><th>B vs A</th><th>C vs A</th><th>D vs A</th><th>D vs B ★</th></tr></thead>
+        <tbody>
+          <tr><td>2,000</td><td>19.37</td><td>8.61</td><td>17.40</td><td class="col-d">6.79</td><td class="pct-hi">55.5%</td><td class="pct-mid">10.2%</td><td class="pct-hi">64.9%</td><td class="pct-hi">21.1%</td></tr>
+          <tr><td>5,000</td><td>42.10</td><td>18.23</td><td>37.80</td><td class="col-d">14.45</td><td class="pct-hi">56.7%</td><td class="pct-mid">10.2%</td><td class="pct-hi">65.7%</td><td class="pct-hi">20.7%</td></tr>
+          <tr><td>10,000</td><td>83.22</td><td>34.02</td><td>76.08</td><td class="col-d">27.82</td><td class="pct-hi">59.1%</td><td class="pct-lo">8.6%</td><td class="pct-hi">66.6%</td><td class="pct-hi">18.2%</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="subsection">
+      <h3>eBird (500,000 rows · 42 attribute columns · 15.9 MB parquet)</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Cap</th><th>A Raw (KB)</th><th>B Gzip (KB)</th><th>C Triage (KB)</th><th>D Triage+Gz (KB)</th><th>B vs A</th><th>C vs A</th><th>D vs A</th><th>D vs B ★</th></tr></thead>
+        <tbody>
+          <tr><td>2,000</td><td>381.84</td><td>126.04</td><td>337.85</td><td class="col-d">101.08</td><td class="pct-hi">67.0%</td><td class="pct-mid">11.5%</td><td class="pct-hi">73.5%</td><td class="pct-hi">19.8%</td></tr>
+          <tr><td>5,000</td><td>909.57</td><td>294.80</td><td>815.18</td><td class="col-d">242.96</td><td class="pct-hi">67.6%</td><td class="pct-mid">10.4%</td><td class="pct-hi">73.3%</td><td class="pct-hi">17.6%</td></tr>
+          <tr><td>10,000</td><td>1,768.24</td><td>537.23</td><td>1,617.68</td><td class="col-d">457.42</td><td class="pct-hi">69.6%</td><td class="pct-lo">8.5%</td><td class="pct-hi">74.1%</td><td class="pct-mid">14.9%</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="subsection">
+      <h3>D vs B — Extra saving from triage on top of gzip (cross-dataset summary)</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Dataset</th><th>cap 2k</th><th>cap 5k</th><th>cap 10k</th><th>Avg</th></tr></thead>
+        <tbody>
+          <tr><td>TIGER2017 / BG</td><td class="pct-hi">24.5%</td><td class="pct-hi">26.3%</td><td class="pct-hi">24.6%</td><td class="pct-hi">25.1%</td></tr>
+          <tr><td>TIGER2017 / TRACT</td><td class="pct-hi">21.1%</td><td class="pct-hi">20.7%</td><td class="pct-hi">18.2%</td><td class="pct-hi">20.0%</td></tr>
+          <tr><td>eBird</td><td class="pct-hi">19.8%</td><td class="pct-hi">17.6%</td><td class="pct-mid">14.9%</td><td class="pct-hi">17.4%</td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:12px;color:var(--muted);margin-top:.6rem;">★ All values positive across all 9 combinations — triage is not subsumed by gzip on any tested dataset.</p>
+    </div>
+  </section>
+
+  <!-- SECTION 3 — GZIP vs TRIAGE+GZIP -->
+  <section class="section">
+    <div class="section-header"><h2>Gzip Only vs Triage + Gzip — Head-to-Head</h2><span class="section-tag">The Core Trade-off</span></div>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:1.25rem;">Direct comparison across all datasets and capacity levels. <strong style="color:var(--text)">B</strong> = gzip with no triage. <strong style="color:var(--accent)">D</strong> = triage applied first, then gzip.</p>
+
+    <div class="subsection">
+      <h3>Size at cap 10,000 — all three datasets</h3>
+      <div style="display:flex;flex-direction:column;gap:1.2rem;margin-bottom:1rem;">
+        <div>
+          <div style="font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:.4rem;">TIGER2017 / BG · cap 10k · raw baseline: 1,155 KB</div>
+          <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.35rem;">
+            <div style="font-family:var(--mono);font-size:11px;width:110px;color:var(--muted);text-align:right;">Gzip only (B)</div>
+            <div style="flex:1;background:var(--border);border-radius:2px;height:22px;overflow:hidden;">
+              <div style="width:51.8%;height:100%;background:var(--amber);display:flex;align-items:center;padding-left:8px;">
+                <span style="font-family:var(--mono);font-size:11px;color:#fff;white-space:nowrap;">597.9 KB (48.2% saved)</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:.6rem;">
+            <div style="font-family:var(--mono);font-size:11px;width:110px;color:var(--accent);text-align:right;font-weight:bold;">Triage+Gzip (D)</div>
+            <div style="flex:1;background:var(--border);border-radius:2px;height:22px;overflow:hidden;">
+              <div style="width:39.0%;height:100%;background:var(--green);display:flex;align-items:center;padding-left:8px;">
+                <span style="font-family:var(--mono);font-size:11px;color:#fff;white-space:nowrap;">450.9 KB (61.0% saved)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div style="font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:.4rem;">TIGER2017 / TRACT · cap 10k · raw baseline: 83.2 KB</div>
+          <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.35rem;">
+            <div style="font-family:var(--mono);font-size:11px;width:110px;color:var(--muted);text-align:right;">Gzip only (B)</div>
+            <div style="flex:1;background:var(--border);border-radius:2px;height:22px;overflow:hidden;">
+              <div style="width:40.9%;height:100%;background:var(--amber);display:flex;align-items:center;padding-left:8px;">
+                <span style="font-family:var(--mono);font-size:11px;color:#fff;white-space:nowrap;">34.0 KB (59.1% saved)</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:.6rem;">
+            <div style="font-family:var(--mono);font-size:11px;width:110px;color:var(--accent);text-align:right;font-weight:bold;">Triage+Gzip (D)</div>
+            <div style="flex:1;background:var(--border);border-radius:2px;height:22px;overflow:hidden;">
+              <div style="width:33.4%;height:100%;background:var(--green);display:flex;align-items:center;padding-left:8px;">
+                <span style="font-family:var(--mono);font-size:11px;color:#fff;white-space:nowrap;">27.8 KB (66.6% saved)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div style="font-family:var(--mono);font-size:12px;color:var(--muted);margin-bottom:.4rem;">eBird · cap 10k · raw baseline: 1,768 KB</div>
+          <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.35rem;">
+            <div style="font-family:var(--mono);font-size:11px;width:110px;color:var(--muted);text-align:right;">Gzip only (B)</div>
+            <div style="flex:1;background:var(--border);border-radius:2px;height:22px;overflow:hidden;">
+              <div style="width:30.4%;height:100%;background:var(--amber);display:flex;align-items:center;padding-left:8px;">
+                <span style="font-family:var(--mono);font-size:11px;color:#fff;white-space:nowrap;">537.2 KB (69.6% saved)</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:.6rem;">
+            <div style="font-family:var(--mono);font-size:11px;width:110px;color:var(--accent);text-align:right;font-weight:bold;">Triage+Gzip (D)</div>
+            <div style="flex:1;background:var(--border);border-radius:2px;height:22px;overflow:hidden;">
+              <div style="width:25.9%;height:100%;background:var(--green);display:flex;align-items:center;padding-left:8px;">
+                <span style="font-family:var(--mono);font-size:11px;color:#fff;white-space:nowrap;">457.4 KB (74.1% saved)</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p style="font-size:12px;color:var(--muted);">Bar widths represent remaining tile size relative to raw. Shorter = better.</p>
+    </div>
+
+    <div class="subsection">
+      <h3>All capacities — numeric detail</h3>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>Dataset</th><th>Cap</th><th>B: Gzip only (KB)</th><th>D: Triage+Gzip (KB)</th><th>Extra saving</th><th>KB saved</th></tr></thead>
+        <tbody>
+          <tr><td>TIGER2017 / BG</td><td>2,000</td><td>122.44</td><td class="col-d">92.46</td><td class="pct-hi">24.5%</td><td>29.98</td></tr>
+          <tr><td>TIGER2017 / BG</td><td>5,000</td><td>304.00</td><td class="col-d">223.96</td><td class="pct-hi">26.3%</td><td>80.04</td></tr>
+          <tr><td>TIGER2017 / BG</td><td>10,000</td><td>597.88</td><td class="col-d">450.89</td><td class="pct-hi">24.6%</td><td>146.99</td></tr>
+          <tr><td>TIGER2017 / TRACT</td><td>2,000</td><td>8.61</td><td class="col-d">6.79</td><td class="pct-hi">21.1%</td><td>1.82</td></tr>
+          <tr><td>TIGER2017 / TRACT</td><td>5,000</td><td>18.23</td><td class="col-d">14.45</td><td class="pct-hi">20.7%</td><td>3.78</td></tr>
+          <tr><td>TIGER2017 / TRACT</td><td>10,000</td><td>34.02</td><td class="col-d">27.82</td><td class="pct-hi">18.2%</td><td>6.20</td></tr>
+          <tr><td>eBird</td><td>2,000</td><td>126.04</td><td class="col-d">101.08</td><td class="pct-hi">19.8%</td><td>24.96</td></tr>
+          <tr><td>eBird</td><td>5,000</td><td>294.80</td><td class="col-d">242.96</td><td class="pct-hi">17.6%</td><td>51.84</td></tr>
+          <tr><td>eBird</td><td>10,000</td><td>537.23</td><td class="col-d">457.42</td><td class="pct-mid">14.9%</td><td>79.81</td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:12px;color:var(--muted);margin-top:.5rem;">Triage adds a further 15–26% on top of gzip across all 9 combinations. Zero serve-time overhead — triage runs only during pre-generation (starlet mvt).</p>
+    </div>
+  </section>
+
+  <!-- SECTION 4 — PIPELINE VALIDATION -->
+  <section class="section">
+    <div class="section-header"><h2>End-to-End Pipeline Validation — eBird</h2><span class="section-tag">tile → mvt → serve</span></div>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:1rem;">Full pipeline run on eBird 500k dataset to confirm gzip flows correctly from disk through the server to the client.</p>
+    <div class="subsection">
+      <h3>Pipeline steps</h3>
+      <div class="pipeline">
+        <div class="pipe-step">starlet tile</div><div class="pipe-arrow">→</div>
+        <div class="pipe-step">500k rows · 1 partition</div><div class="pipe-ok">✓</div><div class="pipe-arrow">→</div>
+        <div class="pipe-step">starlet mvt --zoom 5</div><div class="pipe-arrow">→</div>
+        <div class="pipe-step">68 .mvt.gz tiles</div><div class="pipe-ok">✓</div><div class="pipe-arrow">→</div>
+        <div class="pipe-step">starlet serve</div><div class="pipe-ok">✓</div>
+      </div>
+    </div>
+    <div class="subsection">
+      <h3>Server tile request log (sample)</h3>
+      <div class="server-log">
+        <div><span class="dim">[TileRequest]</span> ebird/0/0/0 &nbsp;bytes=369921 &nbsp;method=<span class="hi">read_from_disk</span> &nbsp;<span class="hi">gzip=True</span> &nbsp;time=0.001s</div>
+        <div><span class="dim">[TileRequest]</span> ebird/1/1/1 &nbsp;bytes=293660 &nbsp;method=<span class="hi">generated</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="hi">gzip=True</span> &nbsp;time=1.700s</div>
+        <div><span class="dim">[TileRequest]</span> ebird/1/1/1 &nbsp;bytes=293660 &nbsp;method=<span class="hi">mem-cache</span> &nbsp;&nbsp;&nbsp;&nbsp;<span class="hi">gzip=True</span> &nbsp;time=0.000s</div>
+        <div><span class="dim">[TileRequest]</span> ebird/2/3/1 &nbsp;bytes=369911 &nbsp;method=<span class="hi">read_from_disk</span> &nbsp;<span class="hi">gzip=True</span> &nbsp;time=0.001s</div>
+      </div>
+      <p style="font-size:12px;color:var(--muted);margin-top:.5rem;">All three serving paths confirmed gzip=True. Browser DevTools: Content-Encoding: gzip. Reference tile: 24 KB wire / 66 KB decoded = 63.5% wire savings.</p>
+    </div>
+  </section>
+
+  <!-- SECTION 5 — KEY FINDINGS -->
+  <section class="section">
+    <div class="section-header"><h2>Key Findings</h2><span class="section-tag">Conclusions</span></div>
+    <div class="findings">
+      <div class="finding"><div class="finding-label">Finding 1 — Triage is effective</div>Triage reduces raw MVT tile size by 8.5–16.1% across all datasets and capacity levels. BG benefits most (richer attribute variety); TRACT and eBird see 8–11%.</div>
+      <div class="finding"><div class="finding-label">Finding 2 — Gzip is the dominant compressor</div>Gzip alone reduces tile size by 47–70%. eBird (42 repeated string columns) compresses most aggressively; TIGER polygon data compresses less.</div>
+      <div class="finding"><div class="finding-label">Finding 3 — Triage and gzip are complementary, not redundant</div>Triage adds a further 15–26% reduction on top of gzip (D vs B) across all datasets. Neither technique subsumes the other.</div>
+      <div class="finding note"><div class="finding-label">Finding 4 — Triage's marginal gain decreases as gzip strength increases</div>On attribute-heavy datasets where gzip is strongest (eBird, ~70%), triage's extra gain shrinks to ~15%. On lower-compression datasets (BG, ~48%), triage adds ~25%.</div>
+      <div class="finding"><div class="finding-label">Finding 5 — Combined pipeline achieves 60–74% reduction vs raw</div>Triage + gzip (column D vs A) reduces tile size by 60–74% relative to raw MVT — the number relevant to real serving bandwidth and client decode time.</div>
+    </div>
+  </section>
+
+  <footer class="report-footer">
+    <span>HiFIVE Starlet · profile_capacity.py · kld_threshold=0.1 · gzip compresslevel=6 · branch: triage-implementation</span>
+    <span>2026-08-05</span>
+  </footer>
+</div>

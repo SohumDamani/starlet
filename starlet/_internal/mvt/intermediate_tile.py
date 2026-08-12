@@ -296,7 +296,13 @@ class IntermediateVectorTile:
             self._seq += 1
             heapq.heappush(self._heap, entry)
 
-    def triage(self, n_bins: int = 10, kld_threshold: float = 0.1) -> None:
+    def triage(
+        self,
+        n_bins: int = 10,
+        kld_threshold: float = 0.1,
+        numeric_only: bool = False,
+        string_only: bool = False,
+    ) -> None:
         """Apply numeric quantization and string prefix triage (HiFIVE §6.2).
 
         Numeric (§6.2.1): for each int/float property, divides the value range
@@ -311,6 +317,9 @@ class IntermediateVectorTile:
         Both steps reduce distinct values in the MVT property dictionary without
         dropping features or changing geometries. Call after add_feature() and
         before encode().
+
+        numeric_only: skip string prefix triage (measure numeric contribution only).
+        string_only:  skip numeric quantization (measure string contribution only).
         """
         if not self._heap:
             return
@@ -333,34 +342,36 @@ class IntermediateVectorTile:
         bin_midpoints: dict[str, list[float]] = {}
         bin_mins: dict[str, float] = {}
         bin_steps: dict[str, float] = {}
-        for col, values in numeric_cols.items():
-            lo, hi = min(values), max(values)
-            if lo == hi:
-                bin_midpoints[col] = [lo]
-                bin_mins[col] = lo
-                bin_steps[col] = 1.0
-            else:
-                step = (hi - lo) / n_bins
-                bin_midpoints[col] = [lo + (i + 0.5) * step for i in range(n_bins)]
-                bin_mins[col] = lo
-                bin_steps[col] = step
+        if not string_only:
+            for col, values in numeric_cols.items():
+                lo, hi = min(values), max(values)
+                if lo == hi:
+                    bin_midpoints[col] = [lo]
+                    bin_mins[col] = lo
+                    bin_steps[col] = 1.0
+                else:
+                    step = (hi - lo) / n_bins
+                    bin_midpoints[col] = [lo + (i + 0.5) * step for i in range(n_bins)]
+                    bin_mins[col] = lo
+                    bin_steps[col] = step
 
         # ------------------------------------------------------------------
         # Step 3: string — find shortest prefix length with entropy <= threshold
         # ------------------------------------------------------------------
         # string_replacements[col] = {original_value: truncated_value}
         string_replacements: dict[str, dict[str, str]] = {}
-        for col, values in string_cols.items():
-            unique_vals = set(values)
-            if len(unique_vals) <= 1:
-                continue
-            max_len = max(len(v) for v in unique_vals)
-            for prefix_len in range(1, max_len + 1):
-                if _prefix_conditional_entropy(values, prefix_len) <= kld_threshold:
-                    if prefix_len < max_len:
-                        # At least one value is shortened — worth applying
-                        string_replacements[col] = {v: v[:prefix_len] for v in unique_vals}
-                    break
+        if not numeric_only:
+            for col, values in string_cols.items():
+                unique_vals = set(values)
+                if len(unique_vals) <= 1:
+                    continue
+                max_len = max(len(v) for v in unique_vals)
+                for prefix_len in range(1, max_len + 1):
+                    if _prefix_conditional_entropy(values, prefix_len) <= kld_threshold:
+                        if prefix_len < max_len:
+                            # At least one value is shortened — worth applying
+                            string_replacements[col] = {v: v[:prefix_len] for v in unique_vals}
+                        break
 
         if not bin_midpoints and not string_replacements:
             return

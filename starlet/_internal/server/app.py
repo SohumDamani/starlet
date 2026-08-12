@@ -10,6 +10,8 @@ import logging
 import os
 import re
 
+import gzip as _gzip
+
 from flask import Flask, Response, render_template, send_from_directory, request
 from flask_cors import CORS
 
@@ -107,17 +109,28 @@ def create_app(
             return {"error": f"Internal error: {str(e)}"}, 500
         elapsed_s = perf_counter() - t0
         generation = tile_info.get("generation", "unknown")
+
+        client_accepts_gzip = "gzip" in request.headers.get("Accept-Encoding", "")
+        tile_is_gzip = tile_info.get("gzip_compressed", False)
+
+        headers = {}
+        if tile_is_gzip and client_accepts_gzip:
+            headers["Content-Encoding"] = "gzip"
+        elif tile_is_gzip and not client_accepts_gzip:
+            data = _gzip.decompress(data)
+
         logger.info(
-            "[TileRequest] %s/%d/%d/%d bytes=%d method=%s time=%.3fs",
+            "[TileRequest] %s/%d/%d/%d bytes=%d method=%s gzip=%s time=%.3fs",
             dataset,
             z,
             x,
             y,
             len(data),
             generation,
+            tile_is_gzip,
             elapsed_s,
         )
-        return Response(data, mimetype="application/vnd.mapbox-vector-tile")
+        return Response(data, mimetype="application/vnd.mapbox-vector-tile", headers=headers)
 
     @app.get("/api/datasets")
     def list_datasets():
