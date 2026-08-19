@@ -44,6 +44,24 @@ DEFAULT_FEATURE_CAPACITY = 2_000
 _FEATURES_SEEN_HEADER = struct.Struct("<Q")
 _FEATURES_SEEN_PADDING = 0
 
+# Rough byte-cost model for the HiFIVE §5 linear size constraint (Eq. 9).
+# MVT/protobuf encodes geometries as delta-encoded varint coordinate pairs and
+# stores attribute values once in a shared per-layer dictionary, referenced by
+# small varint (key_idx, value_idx) tag pairs per cell. These constants are
+# engineering approximations of that encoding, not measured from the actual
+# encoder -- good enough to rank/budget features, not a byte-exact model.
+#
+# _BYTES_PER_VERTEX was data-fit (not guessed) against real polygon tiles
+# from benchmark_data/asia_postal_codes.parquet: pooled real geometry bytes
+# / pooled vertex count across 8 dense real tiles gave ~0.43 bytes/vertex
+# (delta+zigzag-varint encoding makes most polygon-boundary deltas tiny --
+# an initial guess of 4 overestimated real geometry cost by ~8-9x). Rounded
+# up slightly to 0.5 as a deliberate safety margin: for a budget constraint,
+# a mild overestimate is safer than an underestimate that lets the solver
+# exceed the real budget.
+_BYTES_PER_VERTEX = 0.5     # estimated varint cost per (dx, dy) coordinate pair
+_BYTES_PER_CELL_PTR = 2     # estimated varint cost of one (key_idx, value_idx) tag pair
+
 # Features whose transformed bbox fits inside this many tile pixels in BOTH
 # dimensions collapse to their centroid Point (sub-pixel clutter). Judged
 # per-dimension, not by bbox area: a long straight line has bbox area 0 but
@@ -85,6 +103,27 @@ def _prefix_conditional_entropy(values: list[str], prefix_len: int) -> float:
 class _TileFeature:
     geometry: Any
     properties: dict[str, Any]
+
+
+@dataclass
+class _SparsifyProblem:
+    """The CellSparsifyMILP problem (Algorithm 1, Eq. 7-10), assembled into
+    the plain arrays scipy.optimize.milp expects. Built by
+    ``_build_sparsify_problem``; not solved until Step 6.
+    """
+    entries: list
+    columns: list[str]
+    c: Any                              # objective coefficients (negated for minimize)
+    A_ub: Any                           # scipy.sparse constraint matrix
+    b_ub: Any                           # constraint right-hand sides
+    integrality: Any                    # 1 per variable (all binary here)
+    bounds: Any                         # scipy.optimize.Bounds(0, 1)
+    y_index: list[int]                  # var index for each record i
+    u_index: dict[str, int]             # var index for each column
+    x_index: dict[tuple[int, str], int]  # var index for each non-null cell (i, col)
+    budget_bytes: float
+    record_utilities: list[float]
+    cell_utilities: dict[tuple[int, str], float]
 
 
 class IntermediateVectorTile:
@@ -295,6 +334,286 @@ class IntermediateVectorTile:
             entry = (int(priority), self._seq, _TileFeature(geometry, json.loads(property_json)))
             self._seq += 1
             heapq.heappush(self._heap, entry)
+
+    # ------------------------------------------------------------------
+    # HiFIVE §5 sparsification helpers (Algorithm 1: CellSparsifyMILP)
+    # ------------------------------------------------------------------
+
+    def _pixel_footprint(self, geometry: Any) -> float:
+        """Estimate the rendered pixel footprint pc_i of a geometry (§4/§5).
+
+        Transforms the geometry into tile-pixel space (same affine transform
+        used by encode()) and measures polygon area / line length (1px stroke
+        assumed) / point count. A continuous stand-in for the paper's R x R
+        rasterized footprint (Appendix A) -- cheap to compute and sufficient
+        to rank features by visual salience.
+        """
+        transformed = affine_transform(
+            geometry,
+            (
+                self.affine_params[0],
+                0.0,
+                0.0,
+                self.affine_params[3],
+                self.affine_params[4],
+                self.affine_params[5],
+            ),
+        )
+        geom_type = transformed.geom_type
+        if geom_type in ("Polygon", "MultiPolygon"):
+            return max(transformed.area, 1.0)
+        if geom_type in ("LineString", "MultiLineString"):
+            return max(transformed.length, 1.0)
+        # Point, MultiPoint, GeometryCollection: count vertices as pixels.
+        return float(max(1, shapely.count_coordinates(transformed)))
+
+    def _record_utilities(
+        self,
+        footprints: list[float],
+        lambda_rec: float = 1.0,
+        p: float = 1.0,
+    ) -> list[float]:
+        """Record utility U_rec_i from normalized pixel footprints (Eq. 11-12).
+
+        Normalizes footprints by the tile's maximum, then applies
+        U_rec_i = lambda_rec * (pc_i / max_pc) ** p. Larger p sharpens the
+        contrast between visually large and small records.
+        """
+        if not footprints:
+            return []
+        max_footprint = max(footprints)
+        if max_footprint <= 0:
+            return [0.0 for _ in footprints]
+        return [
+            lambda_rec * (footprint / max_footprint) ** p
+            for footprint in footprints
+        ]
+
+    def _geometry_bytes(self, geometry: Any) -> float:
+        """Estimate b_geom_i: encoded geometry byte cost from vertex count (§5).
+
+        Delta-encoded MVT coordinates cost roughly a fixed number of varint
+        bytes per (dx, dy) pair, so this scales linearly with vertex count.
+        """
+        return float(shapely.count_coordinates(geometry)) * _BYTES_PER_VERTEX
+
+    @staticmethod
+    def _dict_entry_bytes(value: Any) -> float:
+        """Estimate the encoded byte cost of one distinct value in the shared
+        MVT value dictionary (feeds b_dict_j in Eq. 9)."""
+        if isinstance(value, bool):
+            return 1.0
+        if isinstance(value, str):
+            return len(value.encode("utf-8")) + 2.0
+        if isinstance(value, (int, float)):
+            return 9.0
+        return len(str(value).encode("utf-8")) + 2.0
+
+    def _column_stats(
+        self, entries: list[tuple[int, int, "_TileFeature"]]
+    ) -> dict[str, dict[str, float]]:
+        """Per-column stats needed for the Eq. 9 size constraint.
+
+        For each non-geometry attribute column j seen across ``entries``,
+        returns ``{"non_null_count": n_j, "dict_bytes": b_dict_j}`` --- the
+        number of non-null cells and the estimated bytes to encode all
+        distinct values in that column's shared dictionary.
+        """
+        columns: dict[str, dict[str, Any]] = {}
+        for _, _, feature in entries:
+            for key, value in feature.properties.items():
+                col = columns.setdefault(key, {"non_null_count": 0, "_seen_values": set()})
+                col["non_null_count"] += 1
+                col["_seen_values"].add(value)
+
+        for col in columns.values():
+            col["dict_bytes"] = sum(self._dict_entry_bytes(v) for v in col["_seen_values"])
+            del col["_seen_values"]
+        return columns
+
+    @staticmethod
+    def _xlogx_ratio(num: float, den: float) -> float:
+        """num * log2(num/den), defined as 0 when num <= 0 (standard x*log(x)
+        convention: the limit of x*log(x) as x -> 0 is 0)."""
+        if num <= 0:
+            return 0.0
+        return num * math.log2(num / den)
+
+    @classmethod
+    def _cell_divergence(cls, a: float, b: float, w: float) -> float:
+        """Closed-form JSD (Eq. 1) between a column's pixel-weighted value
+        distribution and the same distribution with one cell nulled.
+
+        ``a`` = current probability mass in the cell's own value bucket,
+        ``b`` = current probability mass in the null (⊥) bucket, ``w`` =
+        this cell's own normalized pixel weight (the mass that moves from
+        bucket ``a`` to bucket ``b`` when the cell is nulled). Only these
+        two buckets change when nulling a single cell, so this is O(1)
+        instead of recomputing the full column distribution per cell.
+        """
+        m_value = a - w / 2
+        m_null = b + w / 2
+        kld_p = cls._xlogx_ratio(a, m_value) + cls._xlogx_ratio(b, m_null)
+        kld_q = cls._xlogx_ratio(a - w, m_value) + cls._xlogx_ratio(b + w, m_null)
+        return 0.5 * kld_p + 0.5 * kld_q
+
+    def _cell_utilities(
+        self,
+        entries: list[tuple[int, int, "_TileFeature"]],
+        footprints: list[float],
+        columns: set[str] | None = None,
+    ) -> dict[tuple[int, str], float]:
+        """Cell utility U_cell_i,j via normalized divergence (Eq. 13-15).
+
+        For every non-null cell (record index i, column name), estimates the
+        visual harm of nulling that one cell using the closed-form JSD
+        shortcut in ``_cell_divergence``. Returns ``{(i, col): U_cell}``.
+        """
+        if columns is None:
+            columns = set()
+            for _, _, feature in entries:
+                columns.update(feature.properties.keys())
+
+        total_weight = sum(footprints)
+        cell_utility: dict[tuple[int, str], float] = {}
+        if total_weight <= 0:
+            return cell_utility
+
+        for col in columns:
+            value_weights: dict[Any, float] = {}
+            null_weight = total_weight
+            for (_, _, feature), w in zip(entries, footprints):
+                if col in feature.properties:
+                    v = feature.properties[col]
+                    value_weights[v] = value_weights.get(v, 0.0) + w
+                    null_weight -= w
+
+            b = null_weight / total_weight
+            divergences: dict[int, float] = {}
+            for i, ((_, _, feature), w) in enumerate(zip(entries, footprints)):
+                if col not in feature.properties:
+                    continue
+                v = feature.properties[col]
+                a = value_weights[v] / total_weight
+                wn = w / total_weight
+                divergences[i] = self._cell_divergence(a, b, wn)
+
+            max_d = max(divergences.values()) if divergences else 0.0
+            for i, d in divergences.items():
+                normalized = d / max_d if max_d > 0 else 0.0
+                cell_utility[(i, col)] = 1.0 - normalized  # KB_i,j = U_cell_i,j
+
+        return cell_utility
+
+    def _build_sparsify_problem(
+        self,
+        budget_bytes: float,
+        alpha: float = 0.8,
+        lambda_rec: float = 1.0,
+        p: float = 1.0,
+    ) -> "_SparsifyProblem":
+        """Assemble CellSparsifyMILP (Algorithm 1, Eq. 7-10) as plain arrays.
+
+        Lays out one flat variable vector [y_0..y_{N-1}, u_0..u_{d-1},
+        x_0..x_{M-1}] (records, columns, non-null cells), builds the negated
+        objective (Eq. 10) and the structural + size constraints (Eq. 7-9) as
+        a sparse matrix. Does NOT call the solver -- see ``sparsify()``.
+        """
+        from scipy import sparse
+        from scipy.optimize import Bounds
+        import numpy as np
+
+        entries = list(self._heap)
+        n = len(entries)
+
+        columns = sorted({key for _, _, feature in entries for key in feature.properties})
+        column_index = {col: j for j, col in enumerate(columns)}
+        d2 = len(columns)
+
+        cells: list[tuple[int, str]] = [
+            (i, col)
+            for i, (_, _, feature) in enumerate(entries)
+            for col in feature.properties
+        ]
+        m = len(cells)
+
+        y_index = list(range(n))
+        u_index = {col: n + j for col, j in column_index.items()}
+        x_index = {cell: n + d2 + k for k, cell in enumerate(cells)}
+        total_vars = n + d2 + m
+
+        # --- Scores from Steps 2 and 4 ---
+        footprints = [self._pixel_footprint(feature.geometry) for _, _, feature in entries]
+        record_utilities = self._record_utilities(footprints, lambda_rec=lambda_rec, p=p)
+        cell_utilities = self._cell_utilities(entries, footprints, columns=set(columns))
+
+        # --- Costs from Step 3 ---
+        geometry_bytes = [self._geometry_bytes(feature.geometry) for _, _, feature in entries]
+        column_stats = self._column_stats(entries)
+
+        # --- Objective (Eq. 10), negated: scipy.optimize.milp MINIMIZES ---
+        c = np.zeros(total_vars)
+        for i in y_index:
+            c[i] = -alpha * record_utilities[i]
+        for cell, k in x_index.items():
+            i, col = cell
+            c[k] = -(1.0 - alpha) * cell_utilities.get((i, col), 0.0)
+        # u_j coefficients stay 0.0: u only appears in the structural constraint (Eq. 8).
+
+        # --- Structural constraints (Eq. 7, 8): x_k - y_i <= 0, x_k - u_j <= 0 ---
+        rows: list[int] = []
+        cols: list[int] = []
+        data: list[float] = []
+        row = 0
+        for cell, k in x_index.items():
+            i, col = cell
+            rows += [row, row]
+            cols += [k, y_index[i]]
+            data += [1.0, -1.0]
+            row += 1
+
+            rows += [row, row]
+            cols += [k, u_index[col]]
+            data += [1.0, -1.0]
+            row += 1
+
+        # --- Size constraint (Eq. 9): one more row ---
+        for i in y_index:
+            rows.append(row)
+            cols.append(i)
+            data.append(geometry_bytes[i])
+        for cell, k in x_index.items():
+            _, col = cell
+            stats = column_stats[col]
+            per_cell_cost = _BYTES_PER_CELL_PTR + (
+                stats["dict_bytes"] / stats["non_null_count"] if stats["non_null_count"] else 0.0
+            )
+            rows.append(row)
+            cols.append(k)
+            data.append(per_cell_cost)
+        size_row = row
+        row += 1
+
+        total_rows = row
+        A_ub = sparse.csr_matrix((data, (rows, cols)), shape=(total_rows, total_vars))
+        b_ub = np.zeros(total_rows)
+        b_ub[size_row] = budget_bytes
+
+        return _SparsifyProblem(
+            entries=entries,
+            columns=columns,
+            c=c,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            integrality=np.ones(total_vars),
+            bounds=Bounds(0, 1),
+            y_index=y_index,
+            u_index=u_index,
+            x_index=x_index,
+            budget_bytes=budget_bytes,
+            record_utilities=record_utilities,
+            cell_utilities=cell_utilities,
+        )
 
     def triage(
         self,
