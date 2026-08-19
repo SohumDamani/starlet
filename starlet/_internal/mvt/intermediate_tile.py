@@ -99,6 +99,27 @@ def _prefix_conditional_entropy(values: list[str], prefix_len: int) -> float:
     return h
 
 
+def _is_json_column(values: list[str]) -> bool:
+    """True if a string column's values are JSON objects/arrays rather than
+    plain text. Prefix truncation chops raw characters with no regard for
+    structure, which silently corrupts JSON (cutting mid-key/mid-value
+    produces unparseable text) -- such columns must be excluded from string
+    triage rather than trimmed like an ordinary text field.
+    """
+    if not values:
+        return False
+    sample = values if len(values) <= 200 else values[:200]
+    json_count = 0
+    for v in sample:
+        try:
+            parsed = json.loads(v)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, (dict, list)):
+            json_count += 1
+    return json_count / len(sample) >= 0.9
+
+
 @dataclass(frozen=True)
 class _TileFeature:
     geometry: Any
@@ -615,6 +636,75 @@ class IntermediateVectorTile:
             cell_utilities=cell_utilities,
         )
 
+    @staticmethod
+    def _solve_sparsify_problem(problem: "_SparsifyProblem"):
+        """Solve the assembled MILP (Step 5) with scipy.optimize.milp (HiGHS).
+
+        Returns the raw scipy OptimizeResult. Raises if the solver fails --
+        this problem is always feasible (dropping everything gives size 0),
+        so failure means a real solver/setup error, not an infeasible budget.
+        """
+        from scipy.optimize import LinearConstraint, milp
+
+        constraint = LinearConstraint(problem.A_ub, -math.inf, problem.b_ub)
+        result = milp(
+            c=problem.c,
+            constraints=constraint,
+            integrality=problem.integrality,
+            bounds=problem.bounds,
+        )
+        if not result.success:
+            raise RuntimeError(f"Sparsification MILP failed to solve: {result.message}")
+        return result
+
+    def sparsify(
+        self,
+        budget_bytes: float,
+        alpha: float = 0.8,
+        lambda_rec: float = 1.0,
+        p: float = 1.0,
+    ) -> None:
+        """MILP-based sparsification (HiFIVE §5, Algorithm 1: CellSparsifyMILP).
+
+        Builds and solves the MILP from Steps 5-6, then applies its decisions:
+        records with y_i=0 are dropped entirely, columns with u_j=0 are
+        removed from every feature, and individual cells with x_i,j=0 are
+        removed from just that one feature. Call after triage() and before
+        encode().
+
+        Deviation from the paper: Eq. 3's problem statement keeps the row
+        count fixed (|Tout| = |Tin|), nulling a dropped record's geometry
+        rather than removing the row. MVT has no concept of a null geometry,
+        so a y_i=0 record is dropped from the tile outright instead.
+        """
+        if not self._heap:
+            return
+
+        problem = self._build_sparsify_problem(
+            budget_bytes, alpha=alpha, lambda_rec=lambda_rec, p=p
+        )
+        result = self._solve_sparsify_problem(problem)
+        x = [round(value) for value in result.x]
+
+        new_heap: list[tuple[int, int, _TileFeature]] = []
+        for i, (priority, seq, feature) in enumerate(problem.entries):
+            if x[problem.y_index[i]] == 0:
+                continue  # y_i = 0: drop this record entirely
+
+            new_props: dict[str, Any] = {}
+            for key, value in feature.properties.items():
+                if x[problem.u_index[key]] == 0:
+                    continue  # u_j = 0: this column is dropped tile-wide
+                cell_index = problem.x_index.get((i, key))
+                if cell_index is not None and x[cell_index] == 0:
+                    continue  # x_i,j = 0: this specific cell is nulled
+                new_props[key] = value
+
+            new_heap.append((priority, seq, _TileFeature(feature.geometry, new_props)))
+
+        heapq.heapify(new_heap)
+        self._heap = new_heap
+
     def triage(
         self,
         n_bins: int = 10,
@@ -632,6 +722,9 @@ class IntermediateVectorTile:
         below kld_threshold bits. Replaces all values with their length-L prefix.
         kld_threshold=0 requires that every prefix still uniquely identifies its
         original value (zero collisions); higher values allow more merging.
+        Columns whose values are JSON objects/arrays (e.g. an OSM tagsMap-style
+        column) are skipped entirely -- prefix truncation cuts raw characters
+        with no regard for structure and would corrupt the JSON.
 
         Both steps reduce distinct values in the MVT property dictionary without
         dropping features or changing geometries. Call after add_feature() and
@@ -681,6 +774,10 @@ class IntermediateVectorTile:
         string_replacements: dict[str, dict[str, str]] = {}
         if not numeric_only:
             for col, values in string_cols.items():
+                if _is_json_column(values):
+                    # Prefix truncation would corrupt JSON structure -- skip
+                    # this column entirely rather than shorten it blindly.
+                    continue
                 unique_vals = set(values)
                 if len(unique_vals) <= 1:
                     continue

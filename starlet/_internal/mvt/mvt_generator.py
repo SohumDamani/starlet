@@ -392,12 +392,18 @@ def generate_single_mvt_tile(
     buffer: int | None = None,
     layer_name: str = "layer0",
     triage: bool = False,
+    sparsify_budget_bytes: float | None = None,
 ) -> bytes:
     """Generate one MVT tile directly from an indexed Starlet dataset.
 
     When ``triage=True``, applies numeric quantization and string prefix triage
     (HiFIVE §6.2) before encoding. This reduces tile size without dropping any
     features. Defaults to ``False`` so existing callers are unaffected.
+
+    When ``sparsify_budget_bytes`` is set, applies MILP-based sparsification
+    (HiFIVE §5) after triage, targeting that byte budget. May drop features,
+    columns, or individual cell values. ``None`` (default) skips it entirely
+    so existing callers are unaffected.
     """
     feature_capacity = int(
         feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
@@ -441,6 +447,9 @@ def generate_single_mvt_tile(
 
     if triage:
         tile.triage()
+
+    if sparsify_budget_bytes is not None:
+        tile.sparsify(budget_bytes=sparsify_budget_bytes)
 
     return tile.encode(layer_name=layer_name)
 
