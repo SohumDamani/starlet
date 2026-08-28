@@ -13,17 +13,21 @@ from starlet._internal.tiling.geoparquet_source import GeoParquetSource
 _BENCHMARK_DATA = Path(__file__).resolve().parents[2] / "benchmark_data"
 
 
-def _load_asia_postal_codes_sample(n: int):
-    """First ``n`` rows of the real asia_postal_codes dataset, extracted via
+def _load_parquet_sample(filename: str, n: int):
+    """First ``n`` rows of a real benchmark_data parquet file, extracted via
     the same ``_iter_web_mercator_features`` the production map-phase uses
     (mvt_generator.py) -- CRS detection, WKB decode, reprojection to Web
     Mercator, and attribute typing are all real pipeline code, not
     reimplemented here. If that extraction logic changes, this test tracks
     it automatically instead of silently drifting out of sync.
     """
-    source = GeoParquetSource(str(_BENCHMARK_DATA / "asia_postal_codes.parquet"))
+    source = GeoParquetSource(str(_BENCHMARK_DATA / filename))
     table = next(iter(source.iter_tables())).slice(0, n)
     return list(_iter_web_mercator_features(table, source.geom_col))
+
+
+def _load_asia_postal_codes_sample(n: int):
+    return _load_parquet_sample("asia_postal_codes.parquet", n)
 
 
 @pytest.fixture
@@ -345,6 +349,81 @@ def test_triage_string_prefix_on_real_data(real_postal_codes_tile):
     # uname must have shrunk (or stayed the same if no safe merge existed).
     assert after_stats["uname"]["dict_bytes"] <= before_stats["uname"]["dict_bytes"]
     assert len(after_unames) <= len(before_unames)
+
+
+def test_triage_string_prefix_on_non_json_tag_blob():
+    """Edge-case test for HiFIVE Sec 6.2.2's JSON-column guard (_is_json_column).
+
+    OSM2015_parks.parquet's '$2' column stores tags as '[key#value,...]' --
+    real attribute redundancy (many rows share exact values like
+    '[landuse#forest]'), but NOT valid JSON, so _is_json_column's json.loads()
+    check does not skip it (unlike asia_postal_codes' tagsMap, which IS valid
+    JSON and correctly gets skipped -- see the numeric/string tests above).
+
+    This means string-prefix triage runs on it like an ordinary text column.
+    Live-computed prediction (see conversation): conditional entropy does not
+    drop under the default 0.1-bit threshold until prefix length 90, and
+    values run up to 343 characters -- so triage DOES truncate here, cutting
+    long structured tag lists mid-key/mid-value rather than at a semantic
+    boundary. This is the same class of corruption commit 47b6d1f fixed for
+    JSON, just for a serialization format the current guard doesn't recognize.
+    """
+    features = _load_parquet_sample("OSM2015_parks.parquet", 2000)
+
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=5000)
+    for geom, props, priority in features:
+        tile.add_feature(geom, props, priority=priority)
+    assert tile.feature_count == 2000
+
+    def distinct_and_dict_bytes():
+        return (
+            {feature.properties.get("$2") for _, _, feature in tile._heap},
+            tile._column_stats(tile._heap),
+        )
+
+    before_values, before_stats = distinct_and_dict_bytes()
+
+    # Track ONE specific feature (by priority, which triage never changes)
+    # across the before/after snapshots, so we compare the same record's
+    # value to itself rather than independently re-picking "the longest"
+    # from each snapshot (which could pick two different features if
+    # multiple long values happen to tie after truncation).
+    target_priority, _, target_feature = max(
+        tile._heap, key=lambda entry: len(entry[2].properties.get("$2", ""))
+    )
+    before_longest = target_feature.properties["$2"]
+
+    tile.triage(string_only=True)
+
+    after_values, after_stats = distinct_and_dict_bytes()
+    after_longest = next(
+        feature.properties["$2"]
+        for priority, _, feature in tile._heap
+        if priority == target_priority
+    )
+
+    print("\n=== String prefix triage on OSM2015_parks '$2' tag blob (n=2000) ===")
+    print(f"distinct before: {len(before_values)}   after: {len(after_values)}")
+    print(f"dict bytes before: {before_stats['$2']['dict_bytes']:.1f}   "
+          f"after: {after_stats['$2']['dict_bytes']:.1f}")
+    print(f"\nLongest original value ({len(before_longest)} chars):")
+    print(" ", before_longest)
+    print(f"Same feature's value after triage ({len(after_longest)} chars):")
+    print(" ", after_longest)
+
+    assert tile.feature_count == 2000
+
+    # The whole point: this long value should have been cut mid-content, not
+    # left alone -- proving the JSON guard's blind spot actually engages
+    # triage's truncation, unlike tagsMap in the other tests.
+    assert len(before_longest) > 90
+    assert len(after_longest) <= 90
+    assert after_longest != before_longest
+    # And it's a real prefix cut, not a clean re-encoding -- the tail content
+    # (whatever came after char 90) is simply gone.
+    assert before_longest.startswith(after_longest)
+
+    assert after_stats["$2"]["dict_bytes"] <= before_stats["$2"]["dict_bytes"]
 
 
 def test_merge_is_order_independent():
