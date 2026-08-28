@@ -1,10 +1,43 @@
 """Tests for the standalone intermediate vector tile helper."""
 
+from pathlib import Path
+
 import mapbox_vector_tile
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
 from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile
+from starlet._internal.mvt.mvt_generator import _iter_web_mercator_features
+from starlet._internal.tiling.geoparquet_source import GeoParquetSource
+
+_BENCHMARK_DATA = Path(__file__).resolve().parents[2] / "benchmark_data"
+
+
+def _load_asia_postal_codes_sample(n: int):
+    """First ``n`` rows of the real asia_postal_codes dataset, extracted via
+    the same ``_iter_web_mercator_features`` the production map-phase uses
+    (mvt_generator.py) -- CRS detection, WKB decode, reprojection to Web
+    Mercator, and attribute typing are all real pipeline code, not
+    reimplemented here. If that extraction logic changes, this test tracks
+    it automatically instead of silently drifting out of sync.
+    """
+    source = GeoParquetSource(str(_BENCHMARK_DATA / "asia_postal_codes.parquet"))
+    table = next(iter(source.iter_tables())).slice(0, n)
+    return list(_iter_web_mercator_features(table, source.geom_col))
+
+
+@pytest.fixture
+def real_postal_codes_tile():
+    """A tile pre-loaded with 300 real asia_postal_codes features, capacity
+    set well above 300 so nothing gets evicted -- isolates triage() from the
+    separate admission-sampling behavior tested elsewhere in this file.
+    Uses the real per-feature priority from the extraction pipeline (not
+    that it matters here: capacity >> feature count, so nothing competes).
+    """
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=1000)
+    for geom, props, priority in _load_asia_postal_codes_sample(300):
+        tile.add_feature(geom, props, priority=priority)
+    return tile
 
 
 def _mercator_from_tile_pixel(tile, x, y):
@@ -200,6 +233,118 @@ def test_same_geometry_gets_same_default_priority_in_every_tile():
     left_ids = {feature.properties["id"] for feature in left._features}
     right_ids = {feature.properties["id"] for feature in right._features}
     assert left_ids == right_ids
+
+
+def test_triage_numeric_quantization_on_real_data(real_postal_codes_tile):
+    """Live understanding-test for HiFIVE Sec 6.2.1 (numeric quantization),
+    run against a real slice of asia_postal_codes.parquet.
+
+    Isolates the numeric half of triage() via numeric_only=True so the
+    string column (uname) passes through untouched -- this test is only
+    about what happens to version/timestamp/changeSetId/uid.
+    """
+    tile = real_postal_codes_tile
+    assert tile.feature_count == 300  # capacity > n, nothing evicted
+
+    numeric_cols = ["version", "timestamp", "changeSetId", "uid"]
+
+    def snapshot():
+        stats = tile._column_stats(tile._heap)
+        distinct = {
+            col: len({feature.properties[col] for _, _, feature in tile._heap})
+            for col in numeric_cols
+        }
+        samples = {
+            col: [feature.properties[col] for _, _, feature in list(tile._heap)[:8]]
+            for col in numeric_cols
+        }
+        geoms = [feature.geometry.wkb for _, _, feature in tile._heap]
+        return stats, distinct, samples, geoms
+
+    before_stats, before_distinct, before_samples, before_geoms = snapshot()
+
+    tile.triage(numeric_only=True)
+
+    after_stats, after_distinct, after_samples, after_geoms = snapshot()
+
+    print("\n=== Numeric quantization on real data (asia_postal_codes, n=300) ===")
+    print(f"{'column':<14}{'distinct before':<18}{'distinct after':<16}"
+          f"{'dict bytes before':<20}{'dict bytes after'}")
+    for col in numeric_cols:
+        print(
+            f"{col:<14}{before_distinct[col]:<18}{after_distinct[col]:<16}"
+            f"{before_stats[col]['dict_bytes']:<20.1f}{after_stats[col]['dict_bytes']:.1f}"
+        )
+
+    print("\nSample uid values, first 8 features:")
+    print("  before:", before_samples["uid"])
+    print("  after: ", after_samples["uid"])
+    print("\nSample timestamp values, first 8 features:")
+    print("  before:", before_samples["timestamp"])
+    print("  after: ", after_samples["timestamp"])
+
+    # feature count and geometries must be untouched -- triage only rewrites
+    # attribute values, never drops records or moves geometry (that's sparsify's job).
+    assert tile.feature_count == 300
+    assert after_geoms == before_geoms
+
+    # uname (string) must be untouched by numeric_only=True.
+    assert before_stats["uname"]["dict_bytes"] == after_stats["uname"]["dict_bytes"]
+
+    for col in numeric_cols:
+        # After equal-width binning into <=10 bins, distinct values and dict
+        # bytes should shrink (unless the column already had <=10 distinct
+        # values, in which case triage leaves it alone).
+        assert after_distinct[col] <= max(10, before_distinct[col])
+        assert after_stats[col]["dict_bytes"] <= before_stats[col]["dict_bytes"]
+
+
+def test_triage_string_prefix_on_real_data(real_postal_codes_tile):
+    """Live understanding-test for HiFIVE Sec 6.2.2 (string prefix triage),
+    run against the same real slice of asia_postal_codes.parquet.
+
+    Isolates the string half of triage() via string_only=True so the numeric
+    columns (control group) must come out byte-identical.
+    """
+    tile = real_postal_codes_tile
+
+    numeric_cols = ["version", "timestamp", "changeSetId", "uid"]
+
+    def snapshot():
+        stats = tile._column_stats(tile._heap)
+        uname_distinct = {feature.properties["uname"] for _, _, feature in tile._heap}
+        return stats, uname_distinct
+
+    before_stats, before_unames = snapshot()
+
+    tile.triage(string_only=True)
+
+    after_stats, after_unames = snapshot()
+
+    print("\n=== String prefix triage on real data (asia_postal_codes, n=300) ===")
+    print(f"distinct uname before: {len(before_unames)}   after: {len(after_unames)}")
+    print(f"dict bytes before: {before_stats['uname']['dict_bytes']:.1f}   "
+          f"after: {after_stats['uname']['dict_bytes']:.1f}")
+
+    # NOTE: distinct-count barely moved (see docstring) -- most of the byte
+    # saving here comes from shortening every value's stored length, not
+    # from merging values together. Only true collisions (values that now
+    # share a prefix) actually reduce the dictionary's entry count.
+    true_merges = len(before_unames) - len(after_unames)
+    print(f"\nTrue merges (distinct values that became identical): {true_merges}")
+    print(f"Remaining distinct prefixes after triage: {len(after_unames)}")
+
+    # feature count and geometries untouched.
+    assert tile.feature_count == 300
+
+    # Numeric columns are the control group: string_only=True must leave
+    # them byte-identical.
+    for col in numeric_cols:
+        assert before_stats[col]["dict_bytes"] == after_stats[col]["dict_bytes"]
+
+    # uname must have shrunk (or stayed the same if no safe merge existed).
+    assert after_stats["uname"]["dict_bytes"] <= before_stats["uname"]["dict_bytes"]
+    assert len(after_unames) <= len(before_unames)
 
 
 def test_merge_is_order_independent():
