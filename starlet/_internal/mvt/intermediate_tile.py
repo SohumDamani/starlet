@@ -24,6 +24,7 @@ import json
 import math
 import random
 import struct
+import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +42,8 @@ from .helpers import EXTENT, explode_geom, mercator_tile_bounds
 
 
 DEFAULT_FEATURE_CAPACITY = 2_000
+# HiFIVE paper's own default tile-size budget B (Table 6).
+DEFAULT_SPARSIFY_BUDGET_BYTES = 256_000
 _FEATURES_SEEN_HEADER = struct.Struct("<Q")
 _FEATURES_SEEN_PADDING = 0
 
@@ -158,6 +161,26 @@ class _SparsifyProblem:
     budget_bytes: float
     record_utilities: list[float]
     cell_utilities: dict[tuple[int, str], float]
+
+
+@dataclass
+class SolverResult:
+    """Solver-agnostic answer to a _SparsifyProblem.
+
+    Every MILP library we compare (scipy/HiGHS, OR-Tools CP-SAT, standalone
+    HiGHS) has its own native result shape with different field names and
+    different ways of reporting the same information. Each solver adapter's
+    job is to translate its library's answer into this one shared shape, so
+    everything downstream -- sparsify()'s apply logic, and the multi-solver
+    benchmark comparing them -- only ever has to know about this shape, never
+    about any one library's own conventions.
+    """
+    x: list[float]           # decision values, one per variable, same order/indexing as the problem's y/u/x_index maps
+    objective_value: float   # the achieved objective (Eq. 10)
+    wall_time_seconds: float
+    status: str              # "optimal" / "feasible" / "infeasible" / etc. -- normalized per adapter
+    num_variables: int
+    num_constraints: int
 
 
 class IntermediateVectorTile:
@@ -669,29 +692,44 @@ class IntermediateVectorTile:
         )
 
     @staticmethod
-    def _solve_sparsify_problem(problem: "_SparsifyProblem"):
+    def _solve_sparsify_problem_scipy(problem: "_SparsifyProblem") -> SolverResult:
         """Solve the assembled MILP (Step 5) with scipy.optimize.milp (HiGHS).
 
-        Returns the raw scipy OptimizeResult. Raises if the solver fails --
-        this problem is always feasible (dropping everything gives size 0),
-        so failure means a real solver/setup error, not an infeasible budget.
+        The scipy adapter -- see SolverResult for why every solver adapter
+        returns this same shape instead of its library's native result.
+        Raises if the solver fails -- this problem is always feasible
+        (dropping everything gives size 0), so failure means a real
+        solver/setup error, not an infeasible budget.
         """
         from scipy.optimize import LinearConstraint, milp
 
         constraint = LinearConstraint(problem.A_ub, -math.inf, problem.b_ub)
+        start = time.perf_counter()
         result = milp(
             c=problem.c,
             constraints=constraint,
             integrality=problem.integrality,
             bounds=problem.bounds,
         )
+        wall_time_seconds = time.perf_counter() - start
         if not result.success:
             raise RuntimeError(f"Sparsification MILP failed to solve: {result.message}")
-        return result
+
+        return SolverResult(
+            x=list(result.x),
+            # c was negated in _build_sparsify_problem so scipy's minimizer
+            # could be used on our maximization objective (Eq. 10) -- flip
+            # the sign back so this is the real, achieved utility.
+            objective_value=-result.fun,
+            wall_time_seconds=wall_time_seconds,
+            status="optimal",
+            num_variables=len(problem.c),
+            num_constraints=problem.A_ub.shape[0],
+        )
 
     def sparsify(
         self,
-        budget_bytes: float,
+        budget_bytes: float = DEFAULT_SPARSIFY_BUDGET_BYTES,
         alpha: float = 0.8,
         lambda_rec: float = 1.0,
         p: float = 1.0,
@@ -721,7 +759,7 @@ class IntermediateVectorTile:
         problem = self._build_sparsify_problem(
             budget_bytes, alpha=alpha, lambda_rec=lambda_rec, p=p
         )
-        result = self._solve_sparsify_problem(problem)
+        result = self._solve_sparsify_problem_scipy(problem)
         x = [round(value) for value in result.x]
 
         new_heap: list[tuple[int, int, _TileFeature]] = []

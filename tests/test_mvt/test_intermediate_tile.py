@@ -6,8 +6,13 @@ import mapbox_vector_tile
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
-from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile
+from starlet._internal.mvt.intermediate_tile import (
+    DEFAULT_SPARSIFY_BUDGET_BYTES,
+    IntermediateVectorTile,
+    SolverResult,
+)
 from starlet._internal.mvt.mvt_generator import _iter_web_mercator_features
+from starlet._internal.tiling.geojson_source import GeoJSONSource
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource
 
 _BENCHMARK_DATA = Path(__file__).resolve().parents[2] / "benchmark_data"
@@ -30,6 +35,21 @@ def _load_asia_postal_codes_sample(n: int):
     return _load_parquet_sample("asia_postal_codes.parquet", n)
 
 
+def _load_geojson_sample(filename: str, n: int):
+    """First ``n`` features of a real benchmark_data GeoJSON file, via the
+    same real-pipeline functions as ``_load_parquet_sample`` -- GeoJSONSource
+    always uses geom_col="geometry" (see geojson_source.py).
+    """
+    source = GeoJSONSource(str(_BENCHMARK_DATA / filename))
+    features = []
+    for table in source.iter_tables():
+        for geom, attrs, priority in _iter_web_mercator_features(table, "geometry"):
+            features.append((geom, attrs, priority))
+            if len(features) >= n:
+                return features
+    return features
+
+
 @pytest.fixture
 def real_postal_codes_tile():
     """A tile pre-loaded with 300 real asia_postal_codes features, capacity
@@ -40,6 +60,27 @@ def real_postal_codes_tile():
     """
     tile = IntermediateVectorTile(0, 0, 0, feature_capacity=1000)
     for geom, props, priority in _load_asia_postal_codes_sample(300):
+        tile.add_feature(geom, props, priority=priority)
+    return tile
+
+
+def _build_real_tile(dataset: str, n: int) -> IntermediateVectorTile:
+    """Build a tile from the first ``n`` real features of any benchmark_data
+    file, parquet or GeoJSON, auto-detected by extension. Dataset and scale
+    are both plain arguments here (not baked into a fixture) so solver
+    comparisons across datasets/sizes -- the whole point of Phase 1 onward --
+    are just a matter of passing different arguments, not writing new setup.
+    Capacity is exactly n: add_feature() only ever evicts when the heap is
+    already full AND a higher-priority feature arrives, so loading exactly n
+    features into a capacity-n tile never triggers eviction -- every feature
+    lands while the heap still has room. No extra buffer is needed.
+    """
+    if dataset.endswith(".parquet"):
+        sample = _load_parquet_sample(dataset, n)
+    else:
+        sample = _load_geojson_sample(dataset, n)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=n)
+    for geom, props, priority in sample:
         tile.add_feature(geom, props, priority=priority)
     return tile
 
@@ -510,6 +551,67 @@ def test_triage_budget_aware_stops_once_under_budget(real_postal_codes_tile):
 
     assert len(modified_budget_aware) < len(modified_unconditional)
     assert modified_budget_aware <= modified_unconditional
+
+
+@pytest.mark.parametrize(
+    "dataset, n",
+    [
+        ("asia_postal_codes.parquet", 2000),
+        ("NE_states_provinces.geojson", 500),
+    ],
+)
+def test_sparsify_scipy_adapter_returns_solver_result(dataset, n):
+    """Live understanding-test for Phase 1's SolverResult refactor, at the
+    HiFIVE paper's own default budget (256KB, Table 6).
+
+    Parametrized over (dataset, n) rather than a fixed fixture -- adding a
+    new dataset or scale to this test later is one line in the list above,
+    not new setup code. Measured live for the default case (2000 real
+    asia_postal_codes features): unreduced size ~1,070KB, about 4x the
+    256KB default budget, so sparsify() has real, meaningful work to do.
+
+    Confirms: the scipy adapter returns the shared SolverResult shape (not
+    scipy's raw OptimizeResult), the reported variable/constraint counts
+    match the paper's own Sec 5 "Solver cost" formula (N+d+non-null cells
+    variables, 2*non-null cells+1 constraints), and sparsify() end-to-end
+    still applies the decision correctly through the new shape -- including
+    using the new default budget with no argument at all.
+    """
+    tile = _build_real_tile(dataset, n)
+    before_count = tile.feature_count
+    before_size = tile._estimate_size_bytes()
+    assert before_size > DEFAULT_SPARSIFY_BUDGET_BYTES  # sanity: real work needed here
+
+    problem = tile._build_sparsify_problem(DEFAULT_SPARSIFY_BUDGET_BYTES)
+    result = tile._solve_sparsify_problem_scipy(problem)
+
+    print(f"\n=== scipy adapter on real data ({dataset}, n={n}, "
+          f"budget={DEFAULT_SPARSIFY_BUDGET_BYTES:,}) ===")
+    print(f"unreduced size estimate: {before_size:,.0f} bytes")
+    print(f"objective_value: {result.objective_value:.2f}")
+    print(f"wall_time_seconds: {result.wall_time_seconds:.3f}")
+    print(f"status: {result.status}")
+    print(f"num_variables: {result.num_variables}   num_constraints: {result.num_constraints}")
+
+    assert isinstance(result, SolverResult)
+    assert result.status == "optimal"
+    assert result.objective_value > 0
+    assert result.wall_time_seconds > 0
+    assert len(result.x) == result.num_variables
+
+    # Cross-check against the paper's own Sec 5 "Solver cost" formula:
+    # N + d + non-null cells variables, 2*non-null cells + 1 constraints.
+    non_null_cells = len(problem.x_index)
+    assert result.num_variables == len(problem.entries) + len(problem.columns) + non_null_cells
+    assert result.num_constraints == 2 * non_null_cells + 1
+
+    # End-to-end: sparsify() itself, called with NO budget argument at all,
+    # must use the new 256KB default and still apply the decision correctly.
+    tile.sparsify()
+    after_count = tile.feature_count
+    print(f"feature_count: {before_count} -> {after_count}")
+    assert after_count < before_count
+    assert tile._estimate_size_bytes() <= DEFAULT_SPARSIFY_BUDGET_BYTES
 
 
 def test_merge_is_order_independent():
