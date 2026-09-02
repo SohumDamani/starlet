@@ -74,6 +74,34 @@ def feature_priority(wkb_bytes: bytes) -> int:
     return zlib.crc32(wkb_bytes)
 
 
+def _conditional_entropy(values: list, bucket_keys: list) -> float:
+    """Conditional entropy H(value | bucket) in bits, given parallel
+    value/bucket-key sequences.
+
+    Zero when every bucket uniquely identifies its source value -- no
+    information lost by whatever mapping produced the buckets. Grows as more
+    distinct values collapse into the same bucket. This is the shared loss
+    metric behind both string-prefix triage (bucket = value[:prefix_len]) and
+    numeric quantization (bucket = bin index) -- same formula, different
+    bucketing, so their losses are directly comparable when ranking triage
+    candidates by "least damaging first" (HiFIVE Sec 6.2.3).
+    """
+    if not values:
+        return 0.0
+    buckets: dict[Any, dict[Any, int]] = {}
+    for v, b in zip(values, bucket_keys):
+        inner = buckets.setdefault(b, {})
+        inner[v] = inner.get(v, 0) + 1
+    n = len(values)
+    h = 0.0
+    for inner in buckets.values():
+        bucket_n = sum(inner.values())
+        q_b = bucket_n / n
+        h_given_b = sum(-c / bucket_n * math.log2(c / bucket_n) for c in inner.values())
+        h += q_b * h_given_b
+    return h
+
+
 def _prefix_conditional_entropy(values: list[str], prefix_len: int) -> float:
     """Conditional entropy H(value | value[:prefix_len]) in bits.
 
@@ -81,22 +109,7 @@ def _prefix_conditional_entropy(values: list[str], prefix_len: int) -> float:
     lost by truncation. Grows as more distinct values collapse into the same
     prefix bucket.
     """
-    if not values:
-        return 0.0
-    buckets: dict[str, dict[str, int]] = {}
-    for v in values:
-        t = v[:prefix_len]
-        if t not in buckets:
-            buckets[t] = {}
-        buckets[t][v] = buckets[t].get(v, 0) + 1
-    n = len(values)
-    h = 0.0
-    for inner in buckets.values():
-        bucket_n = sum(inner.values())
-        q_t = bucket_n / n
-        h_given_t = sum(-c / bucket_n * math.log2(c / bucket_n) for c in inner.values())
-        h += q_t * h_given_t
-    return h
+    return _conditional_entropy(values, [v[:prefix_len] for v in values])
 
 
 def _is_json_column(values: list[str]) -> bool:
@@ -452,6 +465,25 @@ class IntermediateVectorTile:
             del col["_seen_values"]
         return columns
 
+    def _estimate_size_bytes(
+        self, entries: list[tuple[int, int, "_TileFeature"]] | None = None
+    ) -> float:
+        """Estimate the tile's current encoded size in bytes.
+
+        Same cost model as the Eq. 9 size constraint (geometry bytes + each
+        column's amortized dictionary + pointer cost), just evaluated on the
+        tile as it stands right now rather than as a MILP constraint. Shared
+        by sparsify()'s early-exit check and triage()'s budget-aware loop so
+        both agree on what "the tile's size" means.
+        """
+        if entries is None:
+            entries = list(self._heap)
+        geometry_total = sum(self._geometry_bytes(feature.geometry) for _, _, feature in entries)
+        stats = self._column_stats(entries)
+        dict_total = sum(col["dict_bytes"] for col in stats.values())
+        cell_ptr_total = sum(col["non_null_count"] for col in stats.values()) * _BYTES_PER_CELL_PTR
+        return geometry_total + dict_total + cell_ptr_total
+
     @staticmethod
     def _xlogx_ratio(num: float, den: float) -> float:
         """num * log2(num/den), defined as 0 when num <= 0 (standard x*log(x)
@@ -680,6 +712,12 @@ class IntermediateVectorTile:
         if not self._heap:
             return
 
+        if self._estimate_size_bytes() <= budget_bytes:
+            # Already fits -- the MILP's own optimum would just be "keep
+            # everything," so solving it is a real solve wasted for zero
+            # benefit. Skip it.
+            return
+
         problem = self._build_sparsify_problem(
             budget_bytes, alpha=alpha, lambda_rec=lambda_rec, p=p
         )
@@ -711,6 +749,7 @@ class IntermediateVectorTile:
         kld_threshold: float = 0.1,
         numeric_only: bool = False,
         string_only: bool = False,
+        budget_bytes: float | None = None,
     ) -> None:
         """Apply numeric quantization and string prefix triage (HiFIVE §6.2).
 
@@ -726,6 +765,17 @@ class IntermediateVectorTile:
         column) are skipped entirely -- prefix truncation cuts raw characters
         with no regard for structure and would corrupt the JSON.
 
+        budget_bytes (HiFIVE §6.2.3, "Prioritized Column Reduction"): if given,
+        triage becomes budget-aware instead of unconditional. It does nothing
+        at all if the tile already fits, and otherwise ranks every candidate
+        reduction (each numeric column's quantization, each string column's
+        truncation) by estimated information loss -- using the same
+        conditional-entropy measure for both, so they're directly comparable
+        -- and applies them least-damaging-first, stopping as soon as the
+        running size estimate drops to or below budget_bytes. If left None
+        (default), behavior is unchanged from before: every candidate is
+        applied unconditionally, regardless of need.
+
         Both steps reduce distinct values in the MVT property dictionary without
         dropping features or changing geometries. Call after add_feature() and
         before encode().
@@ -735,6 +785,9 @@ class IntermediateVectorTile:
         """
         if not self._heap:
             return
+
+        if budget_bytes is not None and self._estimate_size_bytes() <= budget_bytes:
+            return  # already fits; no reduction needed
 
         # ------------------------------------------------------------------
         # Step 1: collect column values for numeric and string columns
@@ -748,30 +801,45 @@ class IntermediateVectorTile:
                 elif isinstance(value, str):
                     string_cols.setdefault(key, []).append(value)
 
+        original_stats = self._column_stats(self._heap)
+
         # ------------------------------------------------------------------
-        # Step 2: numeric — compute equal-width bin midpoints per column
+        # Step 2: numeric candidates -- equal-width bin midpoints per column,
+        # each tagged with its conditional-entropy loss (§6.2.3 ranking input)
+        # and the dict_bytes the column would have if this candidate is applied.
         # ------------------------------------------------------------------
-        bin_midpoints: dict[str, list[float]] = {}
-        bin_mins: dict[str, float] = {}
-        bin_steps: dict[str, float] = {}
+        numeric_candidates: dict[str, dict[str, Any]] = {}
         if not string_only:
             for col, values in numeric_cols.items():
                 lo, hi = min(values), max(values)
                 if lo == hi:
-                    bin_midpoints[col] = [lo]
-                    bin_mins[col] = lo
-                    bin_steps[col] = 1.0
+                    midpoints = [lo]
+                    step = 1.0
                 else:
                     step = (hi - lo) / n_bins
-                    bin_midpoints[col] = [lo + (i + 0.5) * step for i in range(n_bins)]
-                    bin_mins[col] = lo
-                    bin_steps[col] = step
+                    # Rounded to 2dp: the exact midpoint is rarely meaningful past
+                    # that (it's a styling stand-in, not a preserved measurement),
+                    # and unrounded values pick up float noise like 6104591.199999999.
+                    midpoints = [round(lo + (i + 0.5) * step, 2) for i in range(n_bins)]
+
+                bin_indices = [
+                    max(0, min(len(midpoints) - 1, int((v - lo) / step))) if lo != hi else 0
+                    for v in values
+                ]
+                used_midpoints = {midpoints[i] for i in bin_indices}
+                numeric_candidates[col] = {
+                    "midpoints": midpoints,
+                    "lo": lo,
+                    "step": step,
+                    "loss": _conditional_entropy(values, bin_indices),
+                    "new_dict_bytes": sum(self._dict_entry_bytes(v) for v in used_midpoints),
+                }
 
         # ------------------------------------------------------------------
-        # Step 3: string — find shortest prefix length with entropy <= threshold
+        # Step 3: string candidates -- shortest prefix length with entropy
+        # <= kld_threshold per column, same loss/new_dict_bytes tagging.
         # ------------------------------------------------------------------
-        # string_replacements[col] = {original_value: truncated_value}
-        string_replacements: dict[str, dict[str, str]] = {}
+        string_candidates: dict[str, dict[str, Any]] = {}
         if not numeric_only:
             for col, values in string_cols.items():
                 if _is_json_column(values):
@@ -783,36 +851,81 @@ class IntermediateVectorTile:
                     continue
                 max_len = max(len(v) for v in unique_vals)
                 for prefix_len in range(1, max_len + 1):
-                    if _prefix_conditional_entropy(values, prefix_len) <= kld_threshold:
+                    loss = _prefix_conditional_entropy(values, prefix_len)
+                    if loss <= kld_threshold:
                         if prefix_len < max_len:
                             # At least one value is shortened — worth applying
-                            string_replacements[col] = {v: v[:prefix_len] for v in unique_vals}
+                            replacements = {v: v[:prefix_len] for v in unique_vals}
+                            string_candidates[col] = {
+                                "replacements": replacements,
+                                "loss": loss,
+                                "new_dict_bytes": sum(
+                                    self._dict_entry_bytes(v) for v in set(replacements.values())
+                                ),
+                            }
                         break
 
-        if not bin_midpoints and not string_replacements:
+        if not numeric_candidates and not string_candidates:
             return
 
         # ------------------------------------------------------------------
-        # Step 4: rebuild heap with quantized / truncated property values
-        # _TileFeature is frozen so new instances must be created
+        # Step 3.5: select which candidates to actually apply.
+        # No budget: apply everything (unconditional, backward-compatible).
+        # With a budget: rank by loss ascending, apply least-damaging-first,
+        # stop the moment the running size estimate is under budget.
+        # ------------------------------------------------------------------
+        if budget_bytes is None:
+            selected_numeric = numeric_candidates
+            selected_string = string_candidates
+        else:
+            geometry_total = sum(
+                self._geometry_bytes(feature.geometry) for _, _, feature in self._heap
+            )
+            cell_ptr_total = (
+                sum(col["non_null_count"] for col in original_stats.values()) * _BYTES_PER_CELL_PTR
+            )
+            dict_total = sum(col["dict_bytes"] for col in original_stats.values())
+            running_size = geometry_total + cell_ptr_total + dict_total
+
+            ranked = sorted(
+                [("numeric", col, cand) for col, cand in numeric_candidates.items()]
+                + [("string", col, cand) for col, cand in string_candidates.items()],
+                key=lambda item: item[2]["loss"],
+            )
+
+            selected_numeric = {}
+            selected_string = {}
+            for kind, col, cand in ranked:
+                running_size += cand["new_dict_bytes"] - original_stats[col]["dict_bytes"]
+                if kind == "numeric":
+                    selected_numeric[col] = cand
+                else:
+                    selected_string[col] = cand
+                if running_size <= budget_bytes:
+                    break
+
+        # ------------------------------------------------------------------
+        # Step 4: rebuild heap with only the selected quantized / truncated
+        # property values applied. _TileFeature is frozen so new instances
+        # must be created.
         # ------------------------------------------------------------------
         new_heap: list[tuple[int, int, _TileFeature]] = []
         for priority, seq, feature in self._heap:
             new_props = dict(feature.properties)
 
-            for col, midpoints in bin_midpoints.items():
+            for col, cand in selected_numeric.items():
                 if col not in new_props:
                     continue
                 value = float(new_props[col])
-                lo = bin_mins[col]
-                step = bin_steps[col]
-                bin_idx = int((value - lo) / step)
+                midpoints = cand["midpoints"]
+                lo, step = cand["lo"], cand["step"]
+                bin_idx = int((value - lo) / step) if step else 0
                 bin_idx = max(0, min(len(midpoints) - 1, bin_idx))
                 new_props[col] = midpoints[bin_idx]
 
-            for col, replacements in string_replacements.items():
+            for col, cand in selected_string.items():
                 if col in new_props and isinstance(new_props[col], str):
-                    new_props[col] = replacements.get(new_props[col], new_props[col])
+                    new_props[col] = cand["replacements"].get(new_props[col], new_props[col])
 
             new_heap.append((priority, seq, _TileFeature(feature.geometry, new_props)))
 

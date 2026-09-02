@@ -426,6 +426,92 @@ def test_triage_string_prefix_on_non_json_tag_blob():
     assert after_stats["$2"]["dict_bytes"] <= before_stats["$2"]["dict_bytes"]
 
 
+def test_triage_budget_aware_skips_when_already_under_budget(real_postal_codes_tile):
+    """Live understanding-test for the new budget_bytes param (HiFIVE Sec 6.2.3).
+
+    Real unreduced size for this 300-feature asia_postal_codes tile is
+    ~114,653 bytes (measured live before writing this test). Giving triage()
+    a generous 200,000-byte budget -- well above that -- should make it do
+    NOTHING at all: this is the actual gap-B bug fix, since the old
+    unconditional triage() would still fully quantize/truncate every column
+    regardless of whether the tile needed it.
+    """
+    tile = real_postal_codes_tile
+    before_size = tile._estimate_size_bytes()
+    before_props = [dict(feature.properties) for _, _, feature in tile._heap]
+
+    tile.triage(budget_bytes=200_000)
+
+    after_size = tile._estimate_size_bytes()
+    after_props = [dict(feature.properties) for _, _, feature in tile._heap]
+
+    print(f"\n=== Budget-aware triage, generous budget (n=300, budget=200,000) ===")
+    print(f"size before: {before_size:.0f}   size after: {after_size:.0f}   "
+          f"(tile was already under budget: {before_size <= 200_000})")
+
+    assert before_size <= 200_000  # sanity: this scenario really is "already fits"
+    assert after_props == before_props  # not a single value was touched
+    assert after_size == before_size
+
+
+def test_triage_budget_aware_stops_once_under_budget(real_postal_codes_tile):
+    """Live understanding-test: with a real budget the tile doesn't already
+    meet, budget-aware triage should touch FEWER columns than unconditional
+    triage() would -- stopping the moment the running estimate drops under
+    budget, rather than fully quantizing/truncating every candidate.
+    """
+    budget_bytes = 95_000
+
+    tile_budget_aware = real_postal_codes_tile
+    before_size = tile_budget_aware._estimate_size_bytes()
+    assert before_size > budget_bytes  # sanity: real data actually needs reduction here
+
+    tile_budget_aware.triage(budget_bytes=budget_bytes)
+    after_size = tile_budget_aware._estimate_size_bytes()
+
+    # A second, independent tile over the same real features, triaged the
+    # OLD unconditional way (no budget), to compare how much MORE it touches.
+    tile_unconditional = IntermediateVectorTile(0, 0, 0, feature_capacity=1000)
+    for geom, props, priority in _load_asia_postal_codes_sample(300):
+        tile_unconditional.add_feature(geom, props, priority=priority)
+    tile_unconditional.triage()  # budget_bytes=None -- old unconditional behavior
+
+    print(f"\n=== Budget-aware vs unconditional triage (n=300, budget={budget_bytes}) ===")
+    print(f"budget-aware final size: {after_size:.0f}   budget: {budget_bytes}")
+
+    assert after_size <= budget_bytes  # the budget was actually respected
+
+    # Prove it stopped early rather than doing everything: compare the count
+    # of *columns whose value set changed* relative to the untouched real
+    # sample, per tile.
+    original_sample = _load_asia_postal_codes_sample(300)
+    original_values = {}
+    for geom, props, priority in original_sample:
+        for col, val in props.items():
+            original_values.setdefault(col, set()).add(val)
+
+    def columns_actually_modified(triaged_tile):
+        modified = set()
+        for col in original_values:
+            current_values = {
+                feature.properties[col]
+                for _, _, feature in triaged_tile._heap
+                if col in feature.properties
+            }
+            if current_values != original_values[col]:
+                modified.add(col)
+        return modified
+
+    modified_budget_aware = columns_actually_modified(tile_budget_aware)
+    modified_unconditional = columns_actually_modified(tile_unconditional)
+
+    print(f"columns modified, budget-aware:   {sorted(modified_budget_aware)}")
+    print(f"columns modified, unconditional:  {sorted(modified_unconditional)}")
+
+    assert len(modified_budget_aware) < len(modified_unconditional)
+    assert modified_budget_aware <= modified_unconditional
+
+
 def test_merge_is_order_independent():
     a = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
     b = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
