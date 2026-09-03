@@ -614,6 +614,90 @@ def test_sparsify_scipy_adapter_returns_solver_result(dataset, n):
     assert tile._estimate_size_bytes() <= DEFAULT_SPARSIFY_BUDGET_BYTES
 
 
+def _true_objective_and_bytes(problem, x):
+    """Recompute the exact (unrounded) objective and byte cost for a given
+    0/1 decision vector, using the ORIGINAL problem arrays -- never whatever
+    rounded/scaled math a specific solver adapter used internally.
+
+    This is the honesty check for any solver that has to approximate (like
+    CP-SAT, which requires integers): does its real-world answer still hold
+    up once its own internal rounding is stripped away?
+
+    In plain terms: a solver like CP-SAT can only work with whole numbers,
+    so before it starts, our real (fractional) scores and byte costs get
+    rounded. That means whatever "score" the solver reports afterward is
+    based on those rounded numbers, not the real ones. This function takes
+    the solver's actual final choice (which things it decided to keep) and
+    plugs that exact choice back into the ORIGINAL, un-rounded formulas --
+    like re-adding up a receipt by hand instead of trusting a rounded total
+    at the bottom. That tells us how much the rounding actually mattered.
+    """
+    objective = sum(problem.c[i] * x[i] for i in range(len(x)))
+    last_row = problem.A_ub.shape[0] - 1
+    A_ub_csr = problem.A_ub.tocsr()
+    start, end = A_ub_csr.indptr[last_row], A_ub_csr.indptr[last_row + 1]
+    bytes_used = sum(A_ub_csr.data[k] * x[A_ub_csr.indices[k]] for k in range(start, end))
+    return objective, bytes_used
+
+
+@pytest.mark.parametrize(
+    "dataset, n",
+    [
+        ("asia_postal_codes.parquet", 2000),
+    ],
+)
+def test_sparsify_cpsat_adapter_matches_scipy_closely(dataset, n):
+    """Live understanding-test for the CP-SAT adapter (Phase 2).
+
+    Solves the SAME real problem instance with both scipy and CP-SAT, then
+    runs CP-SAT's answer through the honesty check above: its own internal
+    rounding must not meaningfully distort the achieved score, and must
+    never cause a REAL budget violation, even though CP-SAT solved against
+    rounded byte costs internally.
+
+    In plain terms: we give the exact same real-world problem to two
+    different solver libraries and see how they each answer it. Then, for
+    CP-SAT specifically, we double-check its answer using the real,
+    un-rounded numbers (via _true_objective_and_bytes) to make sure the
+    rounding it needed to even run didn't secretly cost us much accuracy,
+    and -- most importantly -- didn't let it sneak past the real byte
+    budget while only appearing to respect a rounded version of it.
+    """
+    tile = _build_real_tile(dataset, n)
+    problem = tile._build_sparsify_problem(DEFAULT_SPARSIFY_BUDGET_BYTES)
+
+    scipy_result = tile._solve_sparsify_problem_scipy(problem)
+    cpsat_result = tile._solve_sparsify_problem_cpsat(problem)
+
+    print(f"\n=== scipy vs CP-SAT on real data ({dataset}, n={n}, "
+          f"budget={DEFAULT_SPARSIFY_BUDGET_BYTES:,}) ===")
+    print(f"scipy:  objective={scipy_result.objective_value:.3f}  "
+          f"time={scipy_result.wall_time_seconds:.3f}s  status={scipy_result.status}")
+    print(f"cpsat:  objective={cpsat_result.objective_value:.3f}  "
+          f"time={cpsat_result.wall_time_seconds:.3f}s  status={cpsat_result.status}")
+
+    assert scipy_result.num_variables == cpsat_result.num_variables
+    assert scipy_result.num_constraints == cpsat_result.num_constraints
+    assert cpsat_result.status in ("optimal", "feasible")
+
+    x_cpsat = [round(v) for v in cpsat_result.x]
+    true_objective, true_bytes_used = _true_objective_and_bytes(problem, x_cpsat)
+
+    print(f"\nCP-SAT reported objective (its own scaled/rounded math): "
+          f"{cpsat_result.objective_value:.3f}")
+    print(f"TRUE objective (exact floats, same decisions):          {true_objective:.3f}")
+    print(f"TRUE byte cost used: {true_bytes_used:,.1f}   budget: {DEFAULT_SPARSIFY_BUDGET_BYTES:,}")
+
+    # CP-SAT's internal rounding must not meaningfully distort the score...
+    assert abs(cpsat_result.objective_value - true_objective) < 1.0
+    # ...and must never cause a REAL budget violation, even though CP-SAT
+    # solved against rounded byte costs internally.
+    assert true_bytes_used <= DEFAULT_SPARSIFY_BUDGET_BYTES
+    # And the two solvers' true achieved objectives should be close to each
+    # other -- not identical (different rounding), but close.
+    assert abs(scipy_result.objective_value - true_objective) / scipy_result.objective_value < 0.01
+
+
 def test_merge_is_order_independent():
     a = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
     b = IntermediateVectorTile(0, 0, 0, feature_capacity=2)

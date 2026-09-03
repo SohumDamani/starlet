@@ -43,4 +43,5 @@ dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "pytest-mock>=3.12",
+    "ortools>=9.10",
 ]

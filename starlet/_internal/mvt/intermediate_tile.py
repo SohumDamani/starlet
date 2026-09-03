@@ -44,6 +44,13 @@ from .helpers import EXTENT, explode_geom, mercator_tile_bounds
 DEFAULT_FEATURE_CAPACITY = 2_000
 # HiFIVE paper's own default tile-size budget B (Table 6).
 DEFAULT_SPARSIFY_BUDGET_BYTES = 256_000
+# CP-SAT requires integer objective coefficients; utilities are floats in
+# [0,1], so they're scaled by this factor and rounded before solving, then
+# the achieved objective is divided back down by it -- see
+# _solve_sparsify_problem_cpsat. 10,000x preserves ~4 decimal digits of
+# utility precision, comfortably more than these utility scores carry
+# meaningfully in the first place.
+_CPSAT_UTILITY_SCALE = 10_000
 _FEATURES_SEEN_HEADER = struct.Struct("<Q")
 _FEATURES_SEEN_PADDING = 0
 
@@ -150,7 +157,7 @@ class _SparsifyProblem:
     """
     entries: list
     columns: list[str]
-    c: Any                              # objective coefficients (negated for minimize)
+    c: Any                              # objective coefficients (positive utility; a maximization problem)
     A_ub: Any                           # scipy.sparse constraint matrix
     b_ub: Any                           # constraint right-hand sides
     integrality: Any                    # 1 per variable (all binary here)
@@ -627,13 +634,19 @@ class IntermediateVectorTile:
         geometry_bytes = [self._geometry_bytes(feature.geometry) for _, _, feature in entries]
         column_stats = self._column_stats(entries)
 
-        # --- Objective (Eq. 10), negated: scipy.optimize.milp MINIMIZES ---
+        # --- Objective (Eq. 10): the true, positive utility per variable.
+        # This is a maximization problem; each solver adapter handles that
+        # in whatever way its own library expects (e.g. scipy only minimizes,
+        # so _solve_sparsify_problem_scipy negates its own local copy right
+        # before solving, and un-negates the result right after -- that's a
+        # scipy-specific detail, not something every adapter should have to
+        # know about via this shared array). ---
         c = np.zeros(total_vars)
         for i in y_index:
-            c[i] = -alpha * record_utilities[i]
+            c[i] = alpha * record_utilities[i]
         for cell, k in x_index.items():
             i, col = cell
-            c[k] = -(1.0 - alpha) * cell_utilities.get((i, col), 0.0)
+            c[k] = (1.0 - alpha) * cell_utilities.get((i, col), 0.0)
         # u_j coefficients stay 0.0: u only appears in the structural constraint (Eq. 8).
 
         # --- Structural constraints (Eq. 7, 8): x_k - y_i <= 0, x_k - u_j <= 0 ---
@@ -706,7 +719,11 @@ class IntermediateVectorTile:
         constraint = LinearConstraint(problem.A_ub, -math.inf, problem.b_ub)
         start = time.perf_counter()
         result = milp(
-            c=problem.c,
+            # scipy.optimize.milp only minimizes, but Eq. 10 is a
+            # maximization -- negate a LOCAL copy of the (positive,
+            # solver-agnostic) objective just for this call, rather than
+            # storing it negated on the shared problem for every adapter.
+            c=-problem.c,
             constraints=constraint,
             integrality=problem.integrality,
             bounds=problem.bounds,
@@ -717,14 +734,75 @@ class IntermediateVectorTile:
 
         return SolverResult(
             x=list(result.x),
-            # c was negated in _build_sparsify_problem so scipy's minimizer
-            # could be used on our maximization objective (Eq. 10) -- flip
-            # the sign back so this is the real, achieved utility.
+            # Un-negate to match: result.fun is scipy's minimized (negative)
+            # value, so flip it back to the real, positive utility achieved.
             objective_value=-result.fun,
             wall_time_seconds=wall_time_seconds,
             status="optimal",
             num_variables=len(problem.c),
             num_constraints=problem.A_ub.shape[0],
+        )
+
+    @staticmethod
+    def _solve_sparsify_problem_cpsat(problem: "_SparsifyProblem") -> SolverResult:
+        """Solve the assembled MILP (Step 5) with OR-Tools CP-SAT.
+
+        The CP-SAT adapter -- see SolverResult for why every adapter returns
+        this same shape. CP-SAT is an integer solver throughout: every
+        coefficient, in constraints as well as the objective, must be an
+        integer. This reuses the exact (c, A_ub, b_ub) arrays already built
+        for scipy, translated generically rather than re-deriving the
+        problem's structure a second time:
+          - A_ub/b_ub rows are either exactly 1/-1 (structural constraints)
+            or byte-count estimates (the one size constraint) -- both round
+            to the nearest integer with no meaningful precision loss.
+          - c (utilities in [0,1], positive -- see _build_sparsify_problem)
+            is scaled by _CPSAT_UTILITY_SCALE before rounding, since 0.73
+            and 0.68 would otherwise both collapse to 1 and become
+            indistinguishable.
+        """
+        from ortools.sat.python import cp_model
+
+        model = cp_model.CpModel()
+        n_vars = len(problem.c)
+        all_vars = [model.NewBoolVar(f"x{i}") for i in range(n_vars)]
+
+        A_ub_csr = problem.A_ub.tocsr()
+        for row in range(A_ub_csr.shape[0]):
+            start, end = A_ub_csr.indptr[row], A_ub_csr.indptr[row + 1]
+            cols = A_ub_csr.indices[start:end]
+            vals = A_ub_csr.data[start:end]
+            expr = sum(int(round(v)) * all_vars[c] for v, c in zip(vals, cols))
+            model.Add(expr <= int(round(problem.b_ub[row])))
+
+        objective_terms = [
+            round(problem.c[i] * _CPSAT_UTILITY_SCALE) * all_vars[i] for i in range(n_vars)
+        ]
+        model.Maximize(sum(objective_terms))
+
+        solver = cp_model.CpSolver()
+        status_code = solver.Solve(model)
+
+        status_name = {
+            cp_model.OPTIMAL: "optimal",
+            cp_model.FEASIBLE: "feasible",
+            cp_model.INFEASIBLE: "infeasible",
+            cp_model.MODEL_INVALID: "invalid",
+            cp_model.UNKNOWN: "unknown",
+        }.get(status_code, "unknown")
+
+        if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError(
+                f"Sparsification MILP failed to solve (CP-SAT): status={status_name}"
+            )
+
+        return SolverResult(
+            x=[float(solver.Value(v)) for v in all_vars],
+            objective_value=solver.ObjectiveValue() / _CPSAT_UTILITY_SCALE,
+            wall_time_seconds=solver.WallTime(),
+            status=status_name,
+            num_variables=n_vars,
+            num_constraints=A_ub_csr.shape[0],
         )
 
     def sparsify(
