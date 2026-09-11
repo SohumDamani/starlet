@@ -698,6 +698,53 @@ def test_sparsify_cpsat_adapter_matches_scipy_closely(dataset, n):
     assert abs(scipy_result.objective_value - true_objective) / scipy_result.objective_value < 0.01
 
 
+@pytest.mark.parametrize(
+    "dataset, n",
+    [
+        ("asia_postal_codes.parquet", 2000),
+    ],
+)
+def test_sparsify_highspy_adapter_matches_scipy_exactly(dataset, n):
+    """Live understanding-test for the highspy adapter (Phase 3).
+
+    Unlike CP-SAT, highspy needs no rounding/scaling honesty check: both
+    scipy.optimize.milp and highspy call the SAME underlying HiGHS solver on
+    the SAME real (float) numbers, just through different layers -- scipy's
+    Python wrapper vs. highspy's own native bindings. So their achieved
+    objectives should match almost exactly, not just closely, and the only
+    thing genuinely worth comparing is wall time: is scipy's wrapper adding
+    meaningful overhead over calling HiGHS directly?
+    """
+    tile = _build_real_tile(dataset, n)
+    problem = tile._build_sparsify_problem(DEFAULT_SPARSIFY_BUDGET_BYTES)
+
+    scipy_result = tile._solve_sparsify_problem_scipy(problem)
+    highspy_result = tile._solve_sparsify_problem_highspy(problem)
+
+    print(f"\n=== scipy vs highspy on real data ({dataset}, n={n}, "
+          f"budget={DEFAULT_SPARSIFY_BUDGET_BYTES:,}) ===")
+    print(f"scipy:   objective={scipy_result.objective_value:.6f}  "
+          f"time={scipy_result.wall_time_seconds:.3f}s  status={scipy_result.status}")
+    print(f"highspy: objective={highspy_result.objective_value:.6f}  "
+          f"time={highspy_result.wall_time_seconds:.3f}s  status={highspy_result.status}")
+
+    assert isinstance(highspy_result, SolverResult)
+    assert highspy_result.status == "optimal"
+    assert scipy_result.num_variables == highspy_result.num_variables
+    assert scipy_result.num_constraints == highspy_result.num_constraints
+
+    # Same solver underneath, same un-rounded numbers in -- objectives
+    # should agree to a tight tolerance, not just "close."
+    assert abs(scipy_result.objective_value - highspy_result.objective_value) < 1e-3
+
+    # Budget must genuinely be respected using the real (unrounded) byte
+    # cost, same honesty check as the CP-SAT test -- just expected to be
+    # trivially true here since nothing was rounded going in.
+    x_highspy = [round(v) for v in highspy_result.x]
+    _, true_bytes_used = _true_objective_and_bytes(problem, x_highspy)
+    assert true_bytes_used <= DEFAULT_SPARSIFY_BUDGET_BYTES
+
+
 def test_merge_is_order_independent():
     a = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
     b = IntermediateVectorTile(0, 0, 0, feature_capacity=2)

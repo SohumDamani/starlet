@@ -38,6 +38,7 @@ Thumbs.db
 
 # Project specific
 datasets/
+benchmark_data/
 benchmarks/benchmark_results.*
 *.csv
 *.parquet

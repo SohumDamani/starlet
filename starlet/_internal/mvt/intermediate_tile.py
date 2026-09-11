@@ -805,6 +805,75 @@ class IntermediateVectorTile:
             num_constraints=A_ub_csr.shape[0],
         )
 
+    @staticmethod
+    def _solve_sparsify_problem_highspy(problem: "_SparsifyProblem") -> SolverResult:
+        """Solve the assembled MILP (Step 5) with highspy (native HiGHS).
+
+        The highspy adapter -- see SolverResult for why every adapter
+        returns this same shape. Unlike CP-SAT, HiGHS is not restricted to
+        integers: c/A_ub/b_ub are handed over as real (float) numbers, with
+        no scaling or rounding needed. HiGHS also maximizes natively, so
+        (unlike the scipy adapter) problem.c is used as-is, no negate/
+        un-negate trick required. This exists to isolate whether
+        scipy.optimize.milp's wrapper costs anything over calling the same
+        underlying HiGHS solver directly.
+        """
+        import highspy
+        import numpy as np
+
+        n_vars = len(problem.c)
+        A_ub_csr = problem.A_ub.tocsr()
+        n_rows = A_ub_csr.shape[0]
+
+        lp = highspy.HighsLp()
+        lp.num_col_ = n_vars
+        lp.num_row_ = n_rows
+        lp.col_cost_ = problem.c
+        lp.col_lower_ = np.zeros(n_vars)
+        lp.col_upper_ = np.ones(n_vars)
+        lp.integrality_ = [highspy.HighsVarType.kInteger] * n_vars
+        # A_ub x <= b_ub is one-sided, so the row has no lower bound.
+        lp.row_lower_ = np.full(n_rows, -highspy.kHighsInf)
+        lp.row_upper_ = problem.b_ub
+        lp.sense_ = highspy.ObjSense.kMaximize
+
+        matrix = highspy.HighsSparseMatrix()
+        matrix.format_ = highspy.MatrixFormat.kRowwise
+        matrix.num_col_ = n_vars
+        matrix.num_row_ = n_rows
+        matrix.start_ = A_ub_csr.indptr
+        matrix.index_ = A_ub_csr.indices
+        matrix.value_ = A_ub_csr.data
+        lp.a_matrix_ = matrix
+
+        solver = highspy.Highs()
+        solver.silent()
+        solver.passModel(lp)
+        start = time.perf_counter()
+        solver.run()
+        wall_time_seconds = time.perf_counter() - start
+
+        model_status = solver.getModelStatus()
+        status_name = {
+            highspy.HighsModelStatus.kOptimal: "optimal",
+            highspy.HighsModelStatus.kTimeLimit: "feasible",
+            highspy.HighsModelStatus.kInfeasible: "infeasible",
+        }.get(model_status, "unknown")
+
+        if status_name not in ("optimal", "feasible"):
+            raise RuntimeError(
+                f"Sparsification MILP failed to solve (highspy): status={status_name}"
+            )
+
+        return SolverResult(
+            x=list(solver.getSolution().col_value),
+            objective_value=solver.getObjectiveValue(),
+            wall_time_seconds=wall_time_seconds,
+            status=status_name,
+            num_variables=n_vars,
+            num_constraints=n_rows,
+        )
+
     def sparsify(
         self,
         budget_bytes: float = DEFAULT_SPARSIFY_BUDGET_BYTES,

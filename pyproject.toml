@@ -44,4 +44,5 @@ dev = [
     "pytest-cov>=4.1",
     "pytest-mock>=3.12",
     "ortools>=9.10",
+    "highspy>=1.7",
 ]
