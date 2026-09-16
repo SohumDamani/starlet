@@ -874,6 +874,65 @@ class IntermediateVectorTile:
             num_constraints=n_rows,
         )
 
+    @staticmethod
+    def _solve_sparsify_problem_gurobi(problem: "_SparsifyProblem") -> SolverResult:
+        """Solve the assembled MILP (Step 5) with Gurobi.
+
+        The Gurobi adapter -- see SolverResult for why every adapter returns
+        this same shape. This is the solver the HiFIVE paper's own reference
+        implementation uses (reduceTileSizeLP_Gurobi), so it is the closest
+        thing we have to the authors' original numbers. Gurobi's matrix API
+        takes the shared arrays most directly of any adapter here: the
+        scipy.sparse A_ub is handed over as-is, with no CSR unpacking
+        (highspy) and no per-row Python loop (CP-SAT). Like HiGHS and unlike
+        CP-SAT it works in real floats, so nothing is scaled or rounded; and
+        it maximizes natively, so problem.c is used as-is.
+
+        Requires a full Gurobi license -- the size-limited license bundled
+        with `pip install gurobipy` caps models at 2,000 variables and 2,000
+        constraints, far below real tiles (18,008 variables / 32,001
+        constraints for 2,000 asia_postal_codes features).
+        """
+        import gurobipy as gp
+        from gurobipy import GRB
+
+        n_vars = len(problem.c)
+        n_rows = problem.A_ub.shape[0]
+
+        env = gp.Env(empty=True)
+        env.setParam("OutputFlag", 0)
+        env.start()
+
+        model = gp.Model("cell_sparsify_milp", env=env)
+        x = model.addMVar(n_vars, vtype=GRB.BINARY, name="x")
+        model.addConstr(problem.A_ub @ x <= problem.b_ub, name="budget_and_structure")
+        model.setObjective(problem.c @ x, GRB.MAXIMIZE)
+        model.optimize()
+
+        status_name = {
+            GRB.OPTIMAL: "optimal",
+            GRB.TIME_LIMIT: "feasible",
+            GRB.INFEASIBLE: "infeasible",
+        }.get(model.Status, "unknown")
+
+        # TIME_LIMIT only counts as "feasible" if a solution was actually
+        # found before the cap -- otherwise there is nothing to return.
+        if status_name == "feasible" and model.SolCount == 0:
+            status_name = "unknown"
+        if status_name not in ("optimal", "feasible"):
+            raise RuntimeError(
+                f"Sparsification MILP failed to solve (Gurobi): status={status_name}"
+            )
+
+        return SolverResult(
+            x=list(x.X),
+            objective_value=model.ObjVal,
+            wall_time_seconds=model.Runtime,
+            status=status_name,
+            num_variables=n_vars,
+            num_constraints=n_rows,
+        )
+
     def sparsify(
         self,
         budget_bytes: float = DEFAULT_SPARSIFY_BUDGET_BYTES,

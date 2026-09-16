@@ -745,6 +745,68 @@ def test_sparsify_highspy_adapter_matches_scipy_exactly(dataset, n):
     assert true_bytes_used <= DEFAULT_SPARSIFY_BUDGET_BYTES
 
 
+@pytest.mark.parametrize(
+    "dataset, n",
+    [
+        ("asia_postal_codes.parquet", 2000),
+    ],
+)
+def test_sparsify_gurobi_adapter_matches_scipy_exactly(dataset, n):
+    """Live understanding-test for the Gurobi adapter (Phase 3b).
+
+    Gurobi is the solver the HiFIVE paper's own reference implementation
+    uses, so this is the closest comparison we have to the authors' setup.
+    Like HiGHS and unlike CP-SAT it solves in real floats with no scaling or
+    rounding, so its objective should agree tightly with the scipy/HiGHS
+    baseline rather than merely closely -- any real gap would mean one of
+    the two adapters is feeding the solver a different problem, which is
+    exactly what this test exists to catch.
+
+    Requires a full Gurobi license: the size-limited license bundled with
+    `pip install gurobipy` caps models at 2,000 variables / 2,000
+    constraints, while this problem is ~18,000 / ~32,000.
+    """
+    tile = _build_real_tile(dataset, n)
+    problem = tile._build_sparsify_problem(DEFAULT_SPARSIFY_BUDGET_BYTES)
+
+    scipy_result = tile._solve_sparsify_problem_scipy(problem)
+    gurobi_result = tile._solve_sparsify_problem_gurobi(problem)
+
+    print(f"\n=== scipy vs Gurobi on real data ({dataset}, n={n}, "
+          f"budget={DEFAULT_SPARSIFY_BUDGET_BYTES:,}) ===")
+    print(f"scipy:  objective={scipy_result.objective_value:.6f}  "
+          f"time={scipy_result.wall_time_seconds:.3f}s  status={scipy_result.status}")
+    print(f"gurobi: objective={gurobi_result.objective_value:.6f}  "
+          f"time={gurobi_result.wall_time_seconds:.3f}s  status={gurobi_result.status}")
+
+    assert isinstance(gurobi_result, SolverResult)
+    assert gurobi_result.status == "optimal"
+    assert scipy_result.num_variables == gurobi_result.num_variables
+    assert scipy_result.num_constraints == gurobi_result.num_constraints
+    assert len(gurobi_result.x) == gurobi_result.num_variables
+
+    # Both solve the same un-rounded problem, but "optimal" is not the same
+    # promise in each: Gurobi stops at its default relative MIPGap of 1e-4
+    # (0.01%), so it may legitimately return a slightly different objective
+    # than a solver that closed the gap fully. Compare against that
+    # documented tolerance rather than an arbitrary tighter one -- asserting
+    # more precision than the solver actually guarantees would just make
+    # this test flaky. (Measured on this case: relative delta ~1e-7, three
+    # orders of magnitude inside the allowed gap.)
+    relative_delta = (
+        abs(scipy_result.objective_value - gurobi_result.objective_value)
+        / scipy_result.objective_value
+    )
+    print(f"relative objective delta: {relative_delta:.2e}  (Gurobi MIPGap default: 1e-4)")
+    assert relative_delta < 1e-4
+
+    # Budget must genuinely be respected under the real (unrounded) byte
+    # cost -- same honesty check applied to every adapter.
+    x_gurobi = [round(v) for v in gurobi_result.x]
+    _, true_bytes_used = _true_objective_and_bytes(problem, x_gurobi)
+    assert true_bytes_used <= DEFAULT_SPARSIFY_BUDGET_BYTES
+
+
 def test_merge_is_order_independent():
     a = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
     b = IntermediateVectorTile(0, 0, 0, feature_capacity=2)

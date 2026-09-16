@@ -45,4 +45,5 @@ dev = [
     "pytest-mock>=3.12",
     "ortools>=9.10",
     "highspy>=1.7",
+    "gurobipy>=11",
 ]
