@@ -72,7 +72,7 @@ buffer = 8
                 extents.append(extent)
                 buffers.append(buffer)
 
-            def get_tile(self, z, x, y, output=None):
+            def get_tile(self, z, x, y, output=None, *, attributes=None):
                 return b"tile"
 
         monkeypatch.setattr(server_app, "VectorTiler", FakeTiler)
@@ -97,6 +97,29 @@ cache_size = 11
             assert buffers == [8, 8]
         finally:
             _reset_loaded_config_for_tests()
+
+    def test_tile_endpoint_parses_attribute_whitelist(self, tmp_path, monkeypatch):
+        from starlet._internal.server import app as server_app
+
+        data_dir = tmp_path / "datasets"
+        (data_dir / "sample").mkdir(parents=True)
+        captured = {}
+
+        class FakeTiler:
+            def __init__(self, dataset_dir, memory_cache_size, extent, buffer, tile_attributes=None):
+                pass
+
+            def get_tile(self, z, x, y, output=None, *, attributes=None):
+                captured["attributes"] = attributes
+                return b"tile"
+
+        monkeypatch.setattr(server_app, "VectorTiler", FakeTiler)
+
+        app = create_app(str(data_dir), log_level="ERROR")
+        response = app.test_client().get("/sample/0/0/0.mvt?attributes=name,id,,")
+
+        assert response.status_code == 200
+        assert captured["attributes"] == ("name", "id")
 
     def test_create_app_with_new_on_the_fly_implementation(self, temp_dir):
         """Test app creation with the new on-demand tile generator."""

@@ -33,9 +33,11 @@ import pyarrow.parquet as pq
 import shapely
 
 from starlet._internal.config import config_value
+from starlet._internal.internal_columns import MVT_EXCLUDED_ATTRIBUTE_COLS
 from starlet._internal.mvt.helpers import mercator_tile_bounds
 from starlet._internal.mvt.intermediate_tile import (
     PIXEL_GRID,
+    _mvt_properties,
     normalize_simplify_tolerance,
     normalize_tile_attributes,
 )
@@ -47,7 +49,7 @@ from starlet._internal.mvt.mvt_encoder import (
     packed_segment_dots,
     packed_square_dots,
 )
-from starlet._internal.server.tiler.parquet_index import INTERNAL_COLS, ParquetIndex
+from starlet._internal.server.tiler.parquet_index import ParquetIndex
 
 WORLD = 20037508.342789244
 LAT_MAX = 85.05112878
@@ -245,11 +247,14 @@ class RowGroupCache:
         if info is None:
             pf = pq.ParquetFile(path)
             names, geom_col, has_bbox, crs = self.index._schema_info(path)
-            attrs = [n for n in names if n != geom_col and n not in INTERNAL_COLS]
+            attrs = [n for n in names if n != geom_col and n not in MVT_EXCLUDED_ATTRIBUTE_COLS]
             stats = None
             if has_bbox:
                 md = pf.metadata
-                cols = [pf.schema_arrow.get_field_index(c) for c in BBOX_COLS]
+                # Row-group statistics are indexed by Parquet leaf column, which differs
+                # from the Arrow field index once a nested (struct/map/list) column exists.
+                leaf_index = {md.schema.column(i).path: i for i in range(md.num_columns)}
+                cols = [leaf_index[c] for c in BBOX_COLS]
                 mins = np.full((md.num_row_groups, 2), -np.inf)
                 maxs = np.full((md.num_row_groups, 2), np.inf)
                 for rg in range(md.num_row_groups):
@@ -428,7 +433,7 @@ def generate_tile_ex(
             rows = pa.array(row_of_arr[sub])
             cols = {name: tables[pi][name].take(rows).to_pylist() for name in attr_cols[pi]}
             for j, i in enumerate(sub.tolist()):
-                out[pos[i]] = [(name, cols[name][j]) for name in attr_cols[pi]]
+                out[pos[i]] = list(_mvt_properties({name: cols[name][j] for name in attr_cols[pi]}).items())
         return out
 
     # dots: kind from the geometry type, centre from the bbox

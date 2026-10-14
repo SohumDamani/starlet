@@ -22,7 +22,7 @@ from starlet._internal.tiling.datasource import (
     _ZIP_SUFFIXES,
     _attach_geoparquet_metadata,
     _normalize_decimal_columns,
-    _zip_gdb_member_dirs,
+    _unify_tabular_schemas,
     _wkb_geometry_type,
 )
 from starlet._internal.tiling.nonlinear_wkb import linearize_wkb
@@ -67,12 +67,17 @@ class _OGRVectorSource(DataSource):
 
     def schema(self) -> pa.Schema:
         if self._schema is None:
-            first = next(self.iter_tables(), None)
-            self._schema = first.schema if first is not None else _attach_geoparquet_metadata(
+            schemas = [table.schema for table in self.iter_tables_for_schema_inference()]
+            self._schema = _unify_tabular_schemas(schemas) if schemas else _attach_geoparquet_metadata(
                 pa.schema([(self.geom_col, pa.binary())]),
                 "EPSG:4326",
             )
         return self._schema
+
+    def set_schema(self, schema: pa.Schema) -> None:
+        if self.geom_col not in schema.names:
+            raise ValueError(f"Vector schema must contain geometry column {self.geom_col!r}")
+        self._schema = schema
 
     def input_size_bytes(self) -> int:
         total = 0
@@ -111,6 +116,7 @@ class _OGRVectorSource(DataSource):
         return splits
 
     def iter_tables(self, split: Optional[VectorLayerSplit] = None) -> Iterable[pa.Table]:
+        schema = self.schema()
         splits = [split] if split is not None else self.create_splits()
         for source_split in splits:
             try:
@@ -124,7 +130,30 @@ class _OGRVectorSource(DataSource):
                 raise
             if table.num_rows == 0:
                 continue
+            table = _cast_table_to_schema(table, schema)
             yield table
+
+    def iter_tables_for_schema_inference(
+        self,
+        split: Optional[VectorLayerSplit] = None,
+    ) -> Iterable[pa.Table]:
+        if split is not None:
+            table = self._read_split(split)
+            if table.num_rows:
+                yield table
+            return
+
+        for layer in self._layers:
+            source_split = VectorLayerSplit(
+                path=layer.path,
+                layer=layer.layer,
+                skip_features=0,
+                max_features=1,
+                geometry_type=layer.geometry_type,
+            )
+            table = self._read_split(source_split)
+            if table.num_rows:
+                yield table
 
     def _read_split(self, split: VectorLayerSplit) -> pa.Table:
         import pyogrio
@@ -244,7 +273,7 @@ class _OGRVectorSource(DataSource):
         raise NotImplementedError
 
     def _source_paths_for_size(self) -> List[str]:
-        return sorted({layer.path for layer in self._layers})
+        return sorted({_dataset_size_path(layer.path) for layer in self._layers})
 
     @staticmethod
     def _layers_for_dataset(path: str) -> List[_VectorLayer]:
@@ -323,6 +352,30 @@ class GDBSource(_OGRVectorSource):
 
 def _zip_vsi_path(path: Path) -> str:
     return f"/vsizip/{path}"
+
+
+def _dataset_size_path(path: str) -> str:
+    if path.startswith("/vsizip/"):
+        return path[len("/vsizip/") :]
+    return path
+
+
+def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
+    """Return .gdb directory names contained in a zip archive."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile:
+        return []
+
+    gdb_dirs = set()
+    for name in names:
+        parts = [part for part in Path(name).parts if part not in {"", "."}]
+        for index, part in enumerate(parts):
+            if part.lower().endswith(_GDB_SUFFIXES):
+                gdb_dirs.add("/".join(parts[: index + 1]))
+                break
+    return sorted(gdb_dirs)
 
 
 def _extract_zipped_gdbs(path: Path) -> List[Path]:
@@ -450,3 +503,18 @@ def _probe_vector_split_geometry_types(split: VectorLayerSplit) -> str:
         )
     except Exception as exc:
         return f"actual_wkb_geometry_types=<unavailable: {exc}>"
+
+
+def _cast_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    arrays = []
+    names = []
+    for field in schema:
+        if field.name in table.column_names:
+            arrays.append(table[field.name])
+        else:
+            arrays.append(pa.nulls(table.num_rows, type=field.type))
+        names.append(field.name)
+    projected = pa.table(arrays, names=names)
+    if not projected.schema.equals(schema, check_metadata=False):
+        projected = projected.cast(schema)
+    return projected.replace_schema_metadata(schema.metadata).combine_chunks()

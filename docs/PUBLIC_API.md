@@ -43,6 +43,17 @@ All functions below are available directly from the `starlet` package.
   for Web Mercator coordinates.
 - Query results are GeoPandas `GeoDataFrame` batches in `EPSG:4326`.
 
+## Configuration
+
+```python
+config: dict = starlet.get_config()
+```
+
+Returns the current process-wide Starlet configuration after applying built-in
+defaults and any discovered or explicitly loaded config file values. The
+returned dictionary is a copy, so changing it does not mutate Starlet's active
+configuration.
+
 ## Dataset Discovery
 
 ```python
@@ -142,6 +153,21 @@ tile_bytes: bytes = starlet.get_tile(
 
 Returns a Mapbox Vector Tile payload as `bytes`.
 
+To limit attributes when Starlet generates a tile on the fly, pass an attribute
+whitelist. Geometry is always included. If `attributes` is omitted, all
+attributes are included by default. Pre-generated PMTiles and MVT files are
+returned as-is even when `attributes` is provided.
+
+```python
+tile_bytes = starlet.get_tile(
+    "datasets/postal_codes",
+    z=7,
+    x=22,
+    y=49,
+    attributes=["name", "population"],
+)
+```
+
 Pass an output dictionary to receive details about how the tile was served:
 
 ```python
@@ -170,21 +196,29 @@ path, and elapsed time.
 
 Lookup behavior:
 
-1. Check `<dataset>/mvt/<z>/<x>/<y>.mvt`.
+1. Check pre-generated PMTiles and `<dataset>/mvt/<z>/<x>/<y>.mvt`.
 2. If missing, read matching GeoParquet partitions and generate the MVT on the
    fly.
-3. Generated tiles are not persisted to disk.
+3. If `attributes` is provided for an on-the-fly tile, only those attributes
+   are read from GeoParquet and encoded.
+4. Generated tiles are not persisted to disk.
 
 Typical web response:
 
 ```python
-from flask import Response
+from flask import Response, request
 
 @app.get("/tiles/<dataset>/<int:z>/<int:x>/<int:y>.mvt")
 def tile(dataset: str, z: int, x: int, y: int):
-    data = starlet.get_tile(f"datasets/{dataset}", z, x, y)
+    attrs = request.args.get("attributes")
+    attributes = [a.strip() for a in attrs.split(",") if a.strip()] if attrs else None
+    data = starlet.get_tile(f"datasets/{dataset}", z, x, y, attributes=attributes)
     return Response(data, mimetype="application/vnd.mapbox-vector-tile")
 ```
+
+The built-in REST server accepts the same whitelist as a comma-separated
+query parameter, for example
+`/postal_codes/7/22/49.mvt?attributes=name,population`.
 
 ## Histogram Estimate
 
@@ -318,8 +352,10 @@ Supported sources:
 | --- | --- | --- | --- |
 | GeoParquet | `.parquet`, `.geoparquet`, or a directory containing only GeoParquet files | `geom_col="geometry"` by default | Reads Parquet row groups as splits. Geometry-only sampling reads only the geometry column. |
 | GeoJSON | `.geojson`, `.geojsonl`, `.json`, `.jsonl`, or a directory containing only GeoJSON files | Geometry comes from GeoJSON feature geometry | FeatureCollection inputs are byte-partitioned; GeoJSONL is streamed by feature records. |
+| GeoLife PLT | A `.plt` file or a directory containing only `.plt` files, nested at any depth | Longitude/latitude records become WGS 84 points | Each file is a split. `trajectory_id` repeats the file ID on every point so trajectories can be regrouped. |
+| GPX | A `.gpx` file or a directory containing only `.gpx` files, nested at any depth | GPX longitude/latitude points become WGS 84 points | Tracks, routes, and waypoints are flattened into point rows. File and GPX hierarchy metadata repeats on every point when present in the selected input. |
 | Shapefile | `.shp`, `.zip` containing shapefile sidecars, or a directory containing `.shp` and/or `.zip` files | Geometry comes from the Shapefile geometry | Uses `pyogrio`. Feature-range splits are used when feature counts are available. Geometry-only sampling reads geometry without attributes. |
-| CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, or `csv_wkt_col` | Files are read in row chunks. `src_crs` provides the CRS hint. |
+| CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, `csv_wkt_col`, `csv_x_index` + `csv_y_index`, or `csv_wkt_index` | Files are read in row chunks. `src_crs` provides the CRS hint. Name-based options expect a header row; index-based options read the file as headerless. |
 | File Geodatabase | `.gdb` directory, `.gdb.zip` archive, or a directory containing `.gdb` directories | Geometry comes from each GDB layer | Uses `pyogrio`. Multiple layers are read as separate splits. Zipped GDBs are extracted to a temp cache before reading. |
 
 Directories must contain one supported source type. For example, a directory
@@ -376,6 +412,60 @@ result = starlet.tile(
 GeoJSON FeatureCollections are partitioned by byte range while preserving
 complete feature objects. GeoJSON Lines inputs are streamed by feature record.
 
+### GeoLife PLT Sources
+
+Pass either one `.plt` file or the directory above a collection of trajectory
+files.
+
+```python
+result = starlet.tile(
+    input="data/geolife/trajectory",
+    outdir="datasets/trajectories",
+)
+```
+
+Starlet recursively discovers `.plt` files and turns every trajectory record
+into a WGS 84 point. It preserves `latitude`, `longitude`, `reserved`,
+`altitude` (in feet), `date_days`, `date`, and `time`. The repeated
+`trajectory_id` is just the basename for single-file input and the file path
+relative to the input directory for directory input. `filename` always contains
+the basename. Keeping both makes same-named files in different subdirectories
+unambiguous without losing the convenient filename property.
+
+### GPX Sources
+
+Pass either one `.gpx` file or the directory above a collection of GPX files.
+
+```python
+result = starlet.tile(
+    input="data/tracks",
+    outdir="datasets/gpx-tracks",
+)
+```
+
+Starlet recursively discovers `.gpx` files and flattens tracks (`trkpt`),
+routes (`rtept`), and waypoints (`wpt`) into WGS 84 point rows. As with PLT,
+`trajectory_id` is the basename for single-file input and the file path
+relative to the input directory for directory input. `filename` always contains
+the basename.
+
+The first spatial scan also infers a compact GPX schema while computing the
+sample and MBR. Fields that never appear in the selected input are omitted, so
+a track-only file does not get all-null route columns, and a file without GPX
+metadata does not get all-null metadata columns.
+
+The flattened schema can repeat GPX hierarchy on each point: file metadata
+(`gpx_version`, `gpx_creator`, `gpx_name`, `gpx_description`, `gpx_author`,
+`gpx_time`, `gpx_keywords`, `gpx_bounds`, `gpx_metadata_xml`,
+`gpx_extensions_xml`), point placement (`point_kind`, `track_index`,
+`route_index`, `segment_index`, `point_index`), track/route fields
+(`track_name`, `track_number`, `track_type`, `route_name`, `route_number`,
+`route_type`, plus comments, descriptions, sources, links, and extensions),
+and point fields (`latitude`, `longitude`, `elevation`, `point_time`,
+`point_name`, `point_comment`, `point_description`, `point_source`,
+`point_symbol`, `point_type`, `point_fix`, `point_satellites`, DOP/DGPS
+fields, `point_links`, and `point_extensions_xml`).
+
 ### Shapefile Sources
 
 Use a `.shp` file:
@@ -412,7 +502,21 @@ it requests geometry only so attribute columns are not read unnecessarily.
 
 CSV and TSV inputs need explicit geometry column configuration.
 
-For x/y coordinate columns:
+For headered files, configure geometry fields by column name:
+
+- `csv_x_col` and `csv_y_col` must match the x/y header names, or
+- `csv_wkt_col` must match the WKT header name.
+
+For headerless files, configure geometry fields by zero-based column index:
+
+- `csv_x_index` and `csv_y_index` for x/y coordinates, or
+- `csv_wkt_index` for WKT geometry.
+
+When you use index-based CSV geometry options, Starlet does not read a header
+row from the file. Non-geometry columns are exposed with generated names such
+as `column_0`, `column_1`, and so on.
+
+For x/y coordinate columns in a headered file:
 
 ```python
 result = starlet.tile(
@@ -424,7 +528,19 @@ result = starlet.tile(
 )
 ```
 
-For WKT geometry:
+For x/y coordinate columns in a headerless file:
+
+```python
+result = starlet.tile(
+    input="data/stops-no-header.csv",
+    outdir="datasets/stops",
+    csv_x_index=0,
+    csv_y_index=1,
+    src_crs="EPSG:4326",
+)
+```
+
+For WKT geometry in a headered file:
 
 ```python
 result = starlet.tile(
@@ -433,6 +549,29 @@ result = starlet.tile(
     csv_wkt_col="wkt",
     src_crs="EPSG:4326",
 )
+```
+
+For WKT geometry in a headerless file:
+
+```python
+result = starlet.tile(
+    input="data/parcels-no-header.csv",
+    outdir="datasets/parcels",
+    csv_wkt_index=2,
+    src_crs="EPSG:4326",
+)
+```
+
+UCR Star also supports CSV line segments through its CLI by converting four endpoint columns into temporary WKT `LINESTRING` values before calling Starlet. For a headered CSV:
+
+```bash
+ucrstar add-dataset data/roads.csv --name roads --csv-segment-cols x1,y1,x2,y2
+```
+
+For a headerless CSV:
+
+```bash
+ucrstar add-dataset data/roads-no-header.csv --name roads --csv-segment-indexes 0,1,2,3
 ```
 
 Useful CSV options:
@@ -503,6 +642,16 @@ starlet tile \
   --csv-y-col latitude
 ```
 
+Headerless CSV with x/y columns:
+
+```bash
+starlet tile \
+  --input data/stops-no-header.csv \
+  --outdir datasets/stops \
+  --csv-x-index 0 \
+  --csv-y-index 1
+```
+
 CSV with WKT:
 
 ```bash
@@ -512,10 +661,31 @@ starlet tile \
   --csv-wkt-col wkt
 ```
 
+Headerless CSV with WKT:
+
+```bash
+starlet tile \
+  --input data/parcels-no-header.csv \
+  --outdir datasets/parcels \
+  --csv-wkt-index 2
+```
+
 Shapefile:
 
 ```bash
 starlet tile --input data/roads.zip --outdir datasets/roads
+```
+
+GeoLife PLT directory:
+
+```bash
+starlet tile --input data/geolife/trajectory --outdir datasets/trajectories
+```
+
+GPX file or directory:
+
+```bash
+starlet tile --input data/tracks.gpx --outdir datasets/gpx-tracks
 ```
 
 File Geodatabase:

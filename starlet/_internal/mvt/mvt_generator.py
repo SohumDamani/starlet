@@ -9,10 +9,14 @@ import heapq
 import logging
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import random
+import resource
 import shutil
+import sys
 import tempfile
+import time
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -23,6 +27,7 @@ from pyproj import Transformer
 import shapely
 from shapely import from_wkb
 
+from starlet._internal.histogram.io import resolve_histogram_path
 from starlet._internal.histogram.loader import HistogramLoader
 from starlet._internal.config import config_value, resolve_temp_dir
 from starlet._internal.mvt.helpers import (
@@ -41,19 +46,14 @@ from starlet._internal.mvt.intermediate_tile import (
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
 from starlet._internal.pmtiles.paths import default_pmtiles_path
 from starlet._internal.pmtiles.exporter import export_to_pmtiles
-from starlet._internal.server.tiler.parquet_index import INTERNAL_COLS, ParquetIndex
+from starlet._internal.internal_columns import BBOX_COLS, MVT_EXCLUDED_ATTRIBUTE_COLS
+from starlet._internal.server.tiler.parquet_index import ParquetIndex
 from starlet._internal.tiling.crs import WEB_MERCATOR_CRS, WGS84_CRS, geoparquet_crs, reproject_geometries
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
 
 logger = logging.getLogger(__name__)
 
-_INTERNAL_ATTRIBUTE_COLUMNS = {
-    "_tile_id",
-    "_bbox_xmin",
-    "_bbox_ymin",
-    "_bbox_xmax",
-    "_bbox_ymax",
-}
+_INTERNAL_ATTRIBUTE_COLUMNS = set(MVT_EXCLUDED_ATTRIBUTE_COLS)
 _SINGLE_TILE_INDEX_CACHE_SIZE = 16
 _single_tile_index_cache: "OrderedDict[str, ParquetIndex]" = OrderedDict()
 _REDUCE_GROUP_SIZE = 10
@@ -71,13 +71,21 @@ class DatasetMVTGenerationResult:
 @dataclass(frozen=True)
 class _MapStageResult:
     intermediate_dir: str
-    tile_ids: list[int]
+    tile_part_counts: tuple[tuple[int, int], ...]
+
+    @property
+    def tile_ids(self) -> list[int]:
+        return [tile_id for tile_id, _ in self.tile_part_counts]
+
+    @property
+    def total_parts(self) -> int:
+        return sum(part_count for _, part_count in self.tile_part_counts)
 
 
 @dataclass(frozen=True)
 class _ReduceTileInput:
     tile_id: int
-    intermediate_dirs: tuple[str, ...]
+    mapper_parts: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -86,6 +94,198 @@ class _TableBatch:
 
 
 _MapInput = GeoParquetSplit | _TableBatch
+_MAPPER_PROGRESS_ROWS = 1_000_000
+_MAPPER_MEMORY_CHECK_FEATURES = 10_000
+_MIB = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _MapperMemoryBudget:
+    high_watermark_bytes: int
+    low_watermark_bytes: int
+    total_budget_bytes: int
+
+    @property
+    def high_watermark_mib(self) -> float:
+        return self.high_watermark_bytes / _MIB
+
+    @property
+    def low_watermark_mib(self) -> float:
+        return self.low_watermark_bytes / _MIB
+
+
+def _resolve_total_mvt_memory_budget(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "off", "false", "0"}:
+            return None
+        if normalized == "auto":
+            available = _system_available_memory_bytes() or _system_total_memory_bytes()
+            if available is None:
+                return None
+            return int(available * 0.70)
+    else:
+        if int(value) <= 0:
+            return None
+
+    parsed = _parse_memory_size_bytes(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _mvt_memory_budget_for_stage(
+    *,
+    total_budget_bytes: int | None,
+    active_mappers: int,
+) -> _MapperMemoryBudget | None:
+    if total_budget_bytes is None:
+        return None
+    active_mappers = max(1, int(active_mappers))
+    high = max(_MIB, int(total_budget_bytes / active_mappers))
+    low = max(_MIB, int(high * 0.85))
+    return _MapperMemoryBudget(
+        high_watermark_bytes=high,
+        low_watermark_bytes=low,
+        total_budget_bytes=total_budget_bytes,
+    )
+
+
+def _parse_memory_size_bytes(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s.isdigit():
+            return int(s)
+        suffixes = {
+            "kb": 1024,
+            "mb": 1024 ** 2,
+            "gb": 1024 ** 3,
+            "tb": 1024 ** 4,
+        }
+        for suffix, mul in suffixes.items():
+            if s.endswith(suffix):
+                return int(float(s[: -len(suffix)].strip()) * mul)
+    raise ValueError(f"Invalid MVT memory budget: {value!r}")
+
+
+class _MapperTileCache:
+    def __init__(
+        self,
+        *,
+        mapper_index: int,
+        intermediate_dir: Path,
+        feature_capacity: int,
+        memory_budget: _MapperMemoryBudget | None,
+        extent: int,
+        buffer: int,
+    ) -> None:
+        self.mapper_index = int(mapper_index)
+        self.intermediate_dir = intermediate_dir
+        self.intermediate_dir.mkdir(parents=True, exist_ok=True)
+        self.feature_capacity = int(feature_capacity)
+        self.memory_budget = memory_budget
+        self.extent = int(extent)
+        self.buffer = int(buffer)
+        self.tiles: OrderedDict[int, IntermediateVectorTile] = OrderedDict()
+        self.feature_counts: dict[int, int] = {}
+        self.live_features = 0
+        self.tile_part_counts: dict[int, int] = {}
+        self.peak_live_features = 0
+        self.peak_active_tiles = 0
+        self.memory_evictions = 0
+        self.memory_spill_events = 0
+        self.total_parts = 0
+        self._features_since_memory_check = 0
+
+    def get(self, tile_id: int) -> IntermediateVectorTile | None:
+        tile = self.tiles.get(tile_id)
+        if tile is not None:
+            self.tiles.move_to_end(tile_id)
+        return tile
+
+    def put(self, tile_id: int, tile: IntermediateVectorTile) -> None:
+        self.tiles[tile_id] = tile
+        self.tiles.move_to_end(tile_id)
+        self.feature_counts[tile_id] = tile.feature_count
+        self.peak_active_tiles = max(self.peak_active_tiles, len(self.tiles))
+
+    def account_feature_change(self, tile_id: int) -> None:
+        tile = self.tiles[tile_id]
+        old_count = self.feature_counts.get(tile_id, 0)
+        new_count = tile.feature_count
+        delta = new_count - old_count
+        self.live_features += delta
+        self.feature_counts[tile_id] = new_count
+        self.peak_live_features = max(self.peak_live_features, self.live_features)
+        if delta > 0:
+            self._features_since_memory_check += delta
+            self._evict_under_memory_pressure()
+
+    def flush_remaining(self) -> tuple[tuple[int, int], ...]:
+        while self.tiles:
+            self._write_lru_tile()
+        return tuple(sorted(self.tile_part_counts.items()))
+
+    def _evict_under_memory_pressure(self) -> None:
+        if self.memory_budget is None:
+            return
+        if self._features_since_memory_check < _MAPPER_MEMORY_CHECK_FEATURES:
+            return
+        self._features_since_memory_check = 0
+        current_rss, peak_rss = _process_rss_mib()
+        current_rss = current_rss if current_rss is not None else peak_rss
+        if current_rss is None:
+            return
+        if current_rss * _MIB <= self.memory_budget.high_watermark_bytes:
+            return
+
+        self.memory_spill_events += 1
+        spill_start_rss = current_rss
+        evictions_before = self.memory_evictions
+        while self.tiles and current_rss * _MIB > self.memory_budget.low_watermark_bytes:
+            self.memory_evictions += 1
+            self._write_lru_tile()
+            current_rss, peak_rss = _process_rss_mib()
+            current_rss = current_rss if current_rss is not None else peak_rss
+            if current_rss is None:
+                break
+        logger.info(
+            "DatasetMVTGenerator mapper %d memory spill: rss_mib=%s "
+            "after_rss_mib=%s high_mib=%.1f low_mib=%.1f "
+            "evicted_tiles=%d live_features=%d active_tiles=%d parts=%d",
+            self.mapper_index,
+            _metric(spill_start_rss),
+            _metric(current_rss),
+            self.memory_budget.high_watermark_mib,
+            self.memory_budget.low_watermark_mib,
+            self.memory_evictions - evictions_before,
+            self.live_features,
+            len(self.tiles),
+            self.total_parts,
+        )
+
+    def _write_lru_tile(self) -> None:
+        tile_id, tile = self.tiles.popitem(last=False)
+        self.live_features -= self.feature_counts.pop(tile_id, 0)
+        if tile.feature_count == 0:
+            return
+        z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
+        part_index = self.tile_part_counts.get(tile_id, 0)
+        path = self.intermediate_dir / _intermediate_tile_part_filename(
+            z,
+            x,
+            y,
+            part_index,
+        )
+        tile.write_features(path)
+        self.tile_part_counts[tile_id] = part_index + 1
+        self.total_parts += 1
 
 
 class DatasetMVTGenerator:
@@ -107,6 +307,7 @@ class DatasetMVTGenerator:
         pmtiles_compression: str = "gzip",
         workers: int | None = None,
         feature_capacity: int | None = None,
+        mvt_memory_budget: str | int | None = None,
         extent: int | None = None,
         buffer: int | None = None,
         geom_col: str = "geometry",
@@ -120,7 +321,7 @@ class DatasetMVTGenerator:
         )
         self.simplify_tolerance = config_value("mvt", "simplify_tolerance")
         self.parquet_dir = self.dataset_dir / "parquet_tiles"
-        self.hist_path = self.dataset_dir / "histograms" / "global_prefix.npy"
+        self.hist_path = self.dataset_dir / "histograms" / "global"
         self.num_zoom_levels = int(num_zoom_levels)
         self.threshold = float(threshold)
         self.output_format = output_format.strip().lower()
@@ -131,6 +332,12 @@ class DatasetMVTGenerator:
         self.workers = max(1, int(workers or cpu_default))
         self.feature_capacity = int(
             feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
+        )
+        configured_mvt_memory_budget = config_value("mvt", "mvt_memory_budget")
+        self.mvt_memory_budget = _resolve_total_mvt_memory_budget(
+            mvt_memory_budget
+            if mvt_memory_budget is not None
+            else configured_mvt_memory_budget
         )
         self.extent = int(extent if extent is not None else config_value("mvt", "extent"))
         self.buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
@@ -151,8 +358,12 @@ class DatasetMVTGenerator:
     def run(self) -> DatasetMVTGenerationResult:
         if not self.parquet_dir.is_dir():
             raise FileNotFoundError(f"GeoParquet tile directory not found: {self.parquet_dir}")
-        if not self.hist_path.exists():
-            raise FileNotFoundError(f"Prefix histogram not found: {self.hist_path}")
+        try:
+            self.hist_path = resolve_histogram_path(self.hist_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Histogram not found under {self.dataset_dir / 'histograms'}"
+            ) from exc
 
         from starlet._internal.mvt import rust_engine
 
@@ -177,13 +388,20 @@ class DatasetMVTGenerator:
 
         pmtiles_path = None
         if self.output_format == "pmtiles":
-            pmtiles_path = str(self.pmtiles_path)
-            export_to_pmtiles(
-                mvt_dir=str(self.outdir),
-                output_path=pmtiles_path,
-                tile_type="mvt",
-                compression=self.pmtiles_compression,
-            )
+            if tile_count == 0:
+                logger.warning(
+                    "No MVT tiles passed threshold %s; skipping PMTiles export. "
+                    "Lower the MVT threshold to generate a prebuilt pyramid.",
+                    self.threshold,
+                )
+            else:
+                pmtiles_path = str(self.pmtiles_path)
+                export_to_pmtiles(
+                    mvt_dir=str(self.outdir),
+                    output_path=pmtiles_path,
+                    tile_type="mvt",
+                    compression=self.pmtiles_compression,
+                )
             if self.outdir.exists():
                 shutil.rmtree(self.outdir)
         return DatasetMVTGenerationResult(
@@ -354,31 +572,64 @@ class DatasetMVTGenerator:
         source: GeoParquetSource,
         temp_root: Path,
     ) -> list[_MapStageResult]:
+        active_mappers = min(self.workers, len(map_groups))
+        memory_budget = _mvt_memory_budget_for_stage(
+            total_budget_bytes=self.mvt_memory_budget,
+            active_mappers=active_mappers,
+        )
         logger.info(
-            "DatasetMVTGenerator map stage: groups=%d workers=%d",
+            "DatasetMVTGenerator map stage: groups=%d workers=%d "
+            "feature_capacity=%d mvt_memory_budget_mib=%s "
+            "per_mapper_memory_high_mib=%s per_mapper_memory_low_mib=%s",
             len(map_groups),
             self.workers,
+            self.feature_capacity,
+            _metric(None if self.mvt_memory_budget is None else self.mvt_memory_budget / _MIB),
+            _metric(None if memory_budget is None else memory_budget.high_watermark_mib),
+            _metric(None if memory_budget is None else memory_budget.low_watermark_mib),
         )
-        with ProcessPoolExecutor(max_workers=self.workers) as executor:
-            futures = [
-                executor.submit(
-                    _map_split_group,
-                    group,
-                    source,
-                    str(self.hist_path),
-                    self.num_zoom_levels,
-                    self.threshold,
-                    self.partition_buffer,
-                    self.feature_capacity,
-                    self.extent,
-                    self.buffer,
-                    self.seed + index,
-                    str(temp_root),
-                    index,
-                )
-                for index, group in enumerate(map_groups)
-            ]
-            return [future.result() for future in as_completed(futures)]
+        try:
+            with ProcessPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(
+                        _map_split_group,
+                        group,
+                        source,
+                        str(self.hist_path),
+                        self.num_zoom_levels,
+                        self.threshold,
+                        self.partition_buffer,
+                        self.feature_capacity,
+                        memory_budget,
+                        self.extent,
+                        self.buffer,
+                        self.seed + index,
+                        str(temp_root),
+                        index,
+                    ): index
+                    for index, group in enumerate(map_groups)
+                }
+                results = []
+                for future in as_completed(futures):
+                    mapper_index = futures[future]
+                    result = future.result()
+                    results.append(result)
+                    logger.info(
+                        "DatasetMVTGenerator map progress: completed=%d/%d "
+                        "mapper=%d parts=%d",
+                        len(results),
+                        len(futures),
+                        mapper_index,
+                        result.total_parts,
+                    )
+                return results
+        except Exception:
+            logger.exception(
+                "DatasetMVTGenerator map stage failed. If a worker exited "
+                "abruptly, check the preceding mapper RSS/live_features logs "
+                "for an OOM kill; lower mvt_memory_budget or worker count."
+            )
+            raise
 
     def _run_reduce_stage(self, map_results: list[_MapStageResult]) -> None:
         if not map_results:
@@ -386,14 +637,14 @@ class DatasetMVTGenerator:
             return
 
         self.outdir.mkdir(parents=True, exist_ok=True)
-        tile_locations: dict[int, list[str]] = defaultdict(list)
+        tile_locations: dict[int, list[tuple[str, int]]] = defaultdict(list)
         for result in map_results:
-            for tile_id in result.tile_ids:
-                tile_locations[tile_id].append(result.intermediate_dir)
+            for tile_id, part_count in result.tile_part_counts:
+                tile_locations[tile_id].append((result.intermediate_dir, part_count))
 
         reduce_inputs = [
-            _ReduceTileInput(tile_id, tuple(intermediate_dirs))
-            for tile_id, intermediate_dirs in sorted(tile_locations.items())
+            _ReduceTileInput(tile_id, tuple(mapper_parts))
+            for tile_id, mapper_parts in sorted(tile_locations.items())
         ]
         reduce_groups = _chunk_reduce_inputs(reduce_inputs)
         logger.info(
@@ -429,12 +680,25 @@ def _map_split_group(
     threshold: float,
     partition_buffer: float,
     feature_capacity: int,
+    memory_budget: _MapperMemoryBudget | None,
     extent: int,
     buffer: int,
     seed: int,
     temp_root: str,
     mapper_index: int,
 ) -> _MapStageResult:
+    started = time.monotonic()
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d starting: inputs=%d rss_mib=%s "
+        "peak_rss_mib=%s memory_high_mib=%s memory_low_mib=%s",
+        mapper_index,
+        len(inputs),
+        _metric(current_rss),
+        _metric(peak_rss),
+        _metric(None if memory_budget is None else memory_budget.high_watermark_mib),
+        _metric(None if memory_budget is None else memory_budget.low_watermark_mib),
+    )
     prefix = HistogramLoader(hist_path).load()
     partitioner = PyramidPartitioner(
         (WORLD_MINX, WORLD_MINY, WORLD_MAXX, WORLD_MAXY),
@@ -443,14 +707,43 @@ def _map_split_group(
         size_threshold=threshold,
         buffer=partition_buffer,
     )
-    tiles: dict[int, IntermediateVectorTile] = {}
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d initialized: histogram_mib=%.1f "
+        "rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f",
+        mapper_index,
+        int(getattr(prefix, "nbytes", 0)) / _MIB,
+        _metric(current_rss),
+        _metric(peak_rss),
+        pa.total_allocated_bytes() / _MIB,
+    )
+    intermediate_dir = Path(temp_root) / f"mapper-{mapper_index:06d}"
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    tiles = _MapperTileCache(
+        mapper_index=mapper_index,
+        intermediate_dir=intermediate_dir,
+        feature_capacity=feature_capacity,
+        memory_budget=memory_budget,
+        extent=extent,
+        buffer=buffer,
+    )
 
+    input_rows = 0
+    valid_features = 0
+    tile_feature_offers = 0
+    retained_offers = 0
+    max_batch_bytes = 0
+    next_progress_row = _MAPPER_PROGRESS_ROWS
     for table in _iter_map_input_tables(source, inputs):
+        input_rows += table.num_rows
+        max_batch_bytes = max(max_batch_bytes, int(getattr(table, "nbytes", 0)))
         for geom, attrs, priority in _iter_web_mercator_features(table, source.geom_col):
+            valid_features += 1
             bounds = _positive_bounds_tuple(geom.bounds)
             tile_ids = partitioner.overlapping_tile_ids(bounds)
             if not tile_ids:
                 continue
+            tile_feature_offers += len(tile_ids)
             for tile_id in tile_ids:
                 tile = tiles.get(tile_id)
                 if tile is None:
@@ -463,22 +756,166 @@ def _map_split_group(
                         extent=extent,
                         buffer=buffer,
                     )
-                    tiles[tile_id] = tile
-                tile.add_feature(
+                    tiles.put(tile_id, tile)
+                retained = tile.add_feature(
                     geom,
                     attrs,
                     priority=priority,
                 )
-    intermediate_dir = Path(temp_root) / f"mapper-{mapper_index:06d}"
-    intermediate_dir.mkdir(parents=True, exist_ok=True)
-    tile_ids = []
-    for tile_id, tile in tiles.items():
-        if tile.feature_count == 0:
+                if retained:
+                    retained_offers += 1
+                    tiles.account_feature_change(tile_id)
+        if input_rows >= next_progress_row:
+            _log_mapper_progress(
+                mapper_index=mapper_index,
+                input_rows=input_rows,
+                valid_features=valid_features,
+                tile_feature_offers=tile_feature_offers,
+                retained_offers=retained_offers,
+                max_batch_bytes=max_batch_bytes,
+                tiles=tiles,
+                started=started,
+            )
+            next_progress_row = ((input_rows // _MAPPER_PROGRESS_ROWS) + 1) * _MAPPER_PROGRESS_ROWS
+    tile_part_counts = tiles.flush_remaining()
+    total_parts = sum(part_count for _, part_count in tile_part_counts)
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d finished: input_rows=%d "
+        "valid_features=%d tile_feature_offers=%d retained_offers=%d "
+        "tile_ids=%d parts=%d memory_evictions=%d memory_spill_events=%d "
+        "peak_live_features=%d peak_active_tiles=%d max_batch_mib=%.1f "
+        "rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f elapsed_s=%.1f",
+        mapper_index,
+        input_rows,
+        valid_features,
+        tile_feature_offers,
+        retained_offers,
+        len(tile_part_counts),
+        total_parts,
+        tiles.memory_evictions,
+        tiles.memory_spill_events,
+        tiles.peak_live_features,
+        tiles.peak_active_tiles,
+        max_batch_bytes / _MIB,
+        _metric(current_rss),
+        _metric(peak_rss),
+        pa.total_allocated_bytes() / _MIB,
+        time.monotonic() - started,
+    )
+    return _MapStageResult(str(intermediate_dir), tile_part_counts)
+
+
+def _log_mapper_progress(
+    *,
+    mapper_index: int,
+    input_rows: int,
+    valid_features: int,
+    tile_feature_offers: int,
+    retained_offers: int,
+    max_batch_bytes: int,
+    tiles: _MapperTileCache,
+    started: float,
+) -> None:
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d progress: input_rows=%d "
+        "valid_features=%d tile_feature_offers=%d retained_offers=%d "
+        "live_features=%d active_tiles=%d parts=%d "
+        "memory_evictions=%d memory_spill_events=%d "
+        "max_batch_mib=%.1f rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f "
+        "elapsed_s=%.1f",
+        mapper_index,
+        input_rows,
+        valid_features,
+        tile_feature_offers,
+        retained_offers,
+        tiles.live_features,
+        len(tiles.tiles),
+        tiles.total_parts,
+        tiles.memory_evictions,
+        tiles.memory_spill_events,
+        max_batch_bytes / _MIB,
+        _metric(current_rss),
+        _metric(peak_rss),
+        pa.total_allocated_bytes() / _MIB,
+        time.monotonic() - started,
+    )
+
+
+def _metric(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.1f}"
+
+
+def _process_rss_mib() -> tuple[float | None, float | None]:
+    """Return current and peak RSS for lightweight worker diagnostics."""
+    current = None
+    if sys.platform.startswith("linux"):
+        try:
+            resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+            current = resident_pages * os.sysconf("SC_PAGE_SIZE") / _MIB
+        except (OSError, ValueError, IndexError):
+            pass
+
+    try:
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux reports KiB; macOS and the BSDs report bytes.
+        peak /= _MIB if sys.platform == "darwin" else 1024.0
+    except (OSError, ValueError):
+        peak = None
+    return current, peak
+
+
+def _system_available_memory_bytes() -> int | None:
+    values = []
+    if not sys.platform.startswith("linux"):
+        return _cgroup_available_memory_bytes()
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                values.append(int(line.split()[1]) * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    cgroup_available = _cgroup_available_memory_bytes()
+    if cgroup_available is not None:
+        values.append(cgroup_available)
+    return min(values) if values else None
+
+
+def _cgroup_available_memory_bytes() -> int | None:
+    candidates = (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    )
+    for limit_path, current_path in candidates:
+        try:
+            raw_limit = limit_path.read_text().strip()
+            if raw_limit == "max":
+                continue
+            limit = int(raw_limit)
+            current = int(current_path.read_text().strip())
+        except (OSError, ValueError):
             continue
-        z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
-        tile.write_features(intermediate_dir / _intermediate_tile_filename(z, x, y))
-        tile_ids.append(tile_id)
-    return _MapStageResult(str(intermediate_dir), tile_ids)
+        # Some cgroup v1 hosts expose a huge sentinel rather than a real limit.
+        if limit <= 0 or limit >= 2 ** 60:
+            continue
+        return max(0, limit - current)
+    return None
+
+
+def _system_total_memory_bytes() -> int | None:
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages) * int(page_size)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
 
 
 def _iter_map_input_tables(
@@ -525,7 +962,6 @@ def _reduce_tile_group(
     for reduce_input in reduce_inputs:
         tile_id = reduce_input.tile_id
         z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
-        filename = _intermediate_tile_filename(z, x, y)
         merged = IntermediateVectorTile(
             z,
             x,
@@ -538,24 +974,30 @@ def _reduce_tile_group(
             simplify_tolerance=simplify_tolerance,
         )
         first_tile = True
-        for intermediate_dir in reduce_input.intermediate_dirs:
-            path = Path(intermediate_dir) / filename
-            if not path.exists():
-                continue
-            if first_tile:
-                merged.load_features(path)
-                first_tile = False
-            else:
-                partial = IntermediateVectorTile(
+        for intermediate_dir, part_count in reduce_input.mapper_parts:
+            for part_index in range(part_count):
+                path = Path(intermediate_dir) / _intermediate_tile_part_filename(
                     z,
                     x,
                     y,
-                    feature_capacity=feature_capacity,
-                    extent=extent,
-                    buffer=buffer,
+                    part_index,
                 )
-                partial.load_features(path)
-                merged.merge(partial)
+                if not path.exists():
+                    continue
+                if first_tile:
+                    merged.load_features(path)
+                    first_tile = False
+                else:
+                    partial = IntermediateVectorTile(
+                        z,
+                        x,
+                        y,
+                        feature_capacity=feature_capacity,
+                        extent=extent,
+                        buffer=buffer,
+                    )
+                    partial.load_features(path)
+                    merged.merge(partial)
 
         if merged.feature_count == 0:
             continue
@@ -565,8 +1007,8 @@ def _reduce_tile_group(
             output.write(merged.encode())
 
 
-def _intermediate_tile_filename(z: int, x: int, y: int) -> str:
-    return f"{z}-{x}-{y}.pyarrow"
+def _intermediate_tile_part_filename(z: int, x: int, y: int, part_index: int) -> str:
+    return f"{z}-{x}-{y}-part-{int(part_index):06d}.pyarrow"
 
 
 _RUST_PYRAMID_MAX_TILES = 1_000_000
@@ -609,6 +1051,7 @@ def generate_single_mvt_tile(
     buffer: int | None = None,
     layer_name: str = "layer0",
     tile_attributes: Any = None,
+    attributes: Sequence[str] | None = None,
 ) -> bytes:
     """Generate one MVT tile directly from an indexed Starlet dataset.
 
@@ -621,8 +1064,11 @@ def generate_single_mvt_tile(
     )
     extent = int(extent if extent is not None else config_value("mvt", "extent"))
     buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
-    tile_attributes = normalize_tile_attributes(
-        tile_attributes if tile_attributes is not None else config_value("mvt", "tile_attributes")
+    tile_attributes = _restrict_tile_attributes(
+        normalize_tile_attributes(
+            tile_attributes if tile_attributes is not None else config_value("mvt", "tile_attributes")
+        ),
+        _normalize_attribute_whitelist(attributes),
     )
     if layer_name == "layer0":
         from starlet._internal.mvt import rust_engine
@@ -647,6 +1093,18 @@ def generate_single_mvt_tile(
         feature_capacity=feature_capacity, extent=extent, buffer=buffer, layer_name=layer_name,
         tile_attributes=tile_attributes,
     )
+
+
+def _restrict_tile_attributes(
+    tile_attributes: list[str] | None,
+    attributes: frozenset[str] | None,
+) -> list[str] | None:
+    """Narrow the dataset's tile-attribute policy to a per-request whitelist."""
+    if attributes is None:
+        return tile_attributes
+    if tile_attributes is None:
+        return sorted(attributes)
+    return [column for column in tile_attributes if column in attributes]
 
 
 def _tolerance_arg(value: Any, extent: int) -> float | None:
@@ -697,6 +1155,10 @@ def _generate_single_mvt_tile_python(
     query_bounds = _expand_tile_bounds_for_buffer(tile_bounds, extent, buffer)
     index = _single_tile_parquet_index(parquet_dir)
     query_bounds_4326 = index._transform_bbox(query_bounds, WEB_MERCATOR_CRS, WGS84_CRS)
+    tile_attributes = normalize_tile_attributes(
+        tile_attributes if tile_attributes is not None else config_value("mvt", "tile_attributes")
+    )
+    attribute_set = frozenset(tile_attributes) if tile_attributes is not None else None
 
     tile = IntermediateVectorTile(
         int(z),
@@ -714,6 +1176,7 @@ def _generate_single_mvt_tile_python(
         query_bounds_4326,
         feature_capacity,
         tile,
+        attributes=attribute_set,
     )
     if sampled_features is None:
         sampled_features = _sample_single_tile_records_legacy(
@@ -721,6 +1184,7 @@ def _generate_single_mvt_tile_python(
             query_bounds_4326,
             feature_capacity,
             tile,
+            attributes=attribute_set,
         )
 
     for geom, attrs, priority in sampled_features:
@@ -762,6 +1226,8 @@ def _sample_single_tile_records(
     query_bounds_4326: tuple[float, float, float, float],
     feature_capacity: int,
     tile: IntermediateVectorTile,
+    *,
+    attributes: frozenset[str] | None = None,
 ) -> list[tuple[Any, dict[str, Any], int]] | None:
     """Pre-select raw parquet rows before WKB parsing, with the tile's own
     selection rule: sub-pixel rows (judged from their ``_bbox_*`` columns)
@@ -788,7 +1254,7 @@ def _sample_single_tile_records(
             return None
 
         bbox_native = index._transform_bbox(query_bounds_4326, WGS84_CRS, crs)
-        table = _read_bbox_filtered_table(path, bbox_native)
+        table = _read_bbox_filtered_table(path, bbox_native, geom_col=geom_col, attributes=attributes)
         if table.num_rows == 0:
             continue
         bounds_merc = _mercator_row_bounds(table, crs)
@@ -823,12 +1289,19 @@ def _row_attrs(table: pa.Table, geom_col: str, row_idx: int) -> dict[str, Any]:
     """Attribute dict for a single sampled row (winners only)."""
     attrs: dict[str, Any] = {}
     for column in table.column_names:
-        if column == geom_col or column in INTERNAL_COLS:
+        if column == geom_col or column in _INTERNAL_ATTRIBUTE_COLUMNS:
             continue
         value = table[column][row_idx].as_py()
         if value is not None:
-            attrs[column] = _property_value(value)
+            attrs[column] = value
     return attrs
+
+
+def _normalize_attribute_whitelist(attributes: Sequence[str] | None) -> frozenset[str] | None:
+    if attributes is None:
+        return None
+    normalized = frozenset(str(attribute).strip() for attribute in attributes if str(attribute).strip())
+    return normalized
 
 
 def _sample_single_tile_records_legacy(
@@ -836,6 +1309,8 @@ def _sample_single_tile_records_legacy(
     query_bounds_4326: tuple[float, float, float, float],
     feature_capacity: int,
     tile: IntermediateVectorTile,
+    *,
+    attributes: frozenset[str] | None = None,
 ) -> list[tuple[Any, dict[str, Any], int]]:
     """Pre-select after exact legacy geometry filtering (no bbox columns),
     with the tile's selection rule (pixel cells + top-k).
@@ -850,11 +1325,16 @@ def _sample_single_tile_records_legacy(
     cells: dict[tuple[int, int], tuple] = {}
     seq = 0
 
-    for gdf in index.iter_query_batches(query_bounds_4326, target_crs=WEB_MERCATOR_CRS):
+    for gdf in index.iter_query_batches(
+        query_bounds_4326,
+        target_crs=WEB_MERCATOR_CRS,
+        include_feature_id=True,
+        attributes=attributes,
+    ):
         col_arrays = {
             column: gdf[column].to_numpy()
             for column in gdf.columns
-            if column != "geometry" and column not in INTERNAL_COLS
+            if column != "geometry" and column not in _INTERNAL_ATTRIBUTE_COLUMNS
         }
         for row_idx, geom in enumerate(gdf.geometry.values):
             if geom is None or geom.is_empty:
@@ -867,18 +1347,20 @@ def _sample_single_tile_records_legacy(
     return [
         (
             geom,
-            {
-                column: _property_value(values[row_idx])
-                for column, values in col_arrays.items()
-                if values[row_idx] is not None
-            },
+            _attrs_for_row(col_arrays, row_idx),
             priority,
         )
         for (priority, _, _, geom, col_arrays, row_idx) in list(heap) + list(cells.values())
     ]
 
 
-def _read_bbox_filtered_table(path: Path, bbox_native: tuple[float, float, float, float]) -> pa.Table:
+def _read_bbox_filtered_table(
+    path: Path,
+    bbox_native: tuple[float, float, float, float],
+    *,
+    geom_col: str,
+    attributes: frozenset[str] | None = None,
+) -> pa.Table:
     minx, miny, maxx, maxy = bbox_native
     flt = (
         (pc.field("_bbox_xmax") >= minx)
@@ -886,7 +1368,12 @@ def _read_bbox_filtered_table(path: Path, bbox_native: tuple[float, float, float
         & (pc.field("_bbox_ymax") >= miny)
         & (pc.field("_bbox_ymin") <= maxy)
     )
-    return pq.read_table(path, filters=flt)
+    columns = None
+    if attributes is not None:
+        names = pq.ParquetFile(path).schema_arrow.names
+        required = {geom_col, *BBOX_COLS}
+        columns = [name for name in names if name in required or name in attributes]
+    return pq.read_table(path, filters=flt, columns=columns)
 
 
 def _decode_sampled_features(
@@ -961,11 +1448,7 @@ def _iter_web_mercator_features(table: Any, geom_col: str) -> Iterable[tuple[Any
     for index, geom in enumerate(geometries):
         if geom is None or geom.is_empty:
             continue
-        attrs = {
-            column: _property_value(values[index])
-            for column, values in attrs_by_column.items()
-            if values[index] is not None
-        }
+        attrs = _attrs_for_row(attrs_by_column, index)
         # Priority from the *source* WKB bytes: identical for this feature in
         # every tile/zoom it touches (and in the on-demand serving sampler),
         # which is what makes sampling seam-consistent.
@@ -981,15 +1464,12 @@ def _positive_bounds_tuple(bounds: tuple[float, float, float, float]) -> tuple[f
     return minx, miny, maxx, maxy
 
 
-def _property_value(value: Any) -> Any:
-    # numpy scalars (from ``Series.to_numpy()`` in the legacy path) are not
-    # instances of the Python builtins: ``np.int64`` would otherwise be
-    # stringified, breaking numeric styling on on-demand tiles.
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
+def _attrs_for_row(attrs_by_column: dict[str, Any], row_idx: int) -> dict[str, Any]:
+    return {
+        column: values[row_idx]
+        for column, values in attrs_by_column.items()
+        if values[row_idx] is not None
+    }
 
 
 def _group_splits(splits: Sequence[GeoParquetSplit], num_groups: int) -> list[list[GeoParquetSplit]]:

@@ -7,6 +7,7 @@ import dataclasses
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from starlet._internal.histogram.io import load_histogram, resolve_histogram_path
 from starlet._internal.pmtiles.paths import discover_pmtiles_path
 
 # numpy / pyarrow / geopandas-adjacent imports are deliberately deferred to
@@ -105,7 +106,11 @@ class Dataset:
 
     @property
     def has_histograms(self) -> bool:
-        return (self._root / "histograms" / "global_prefix.npy").exists()
+        try:
+            resolve_histogram_path(self._root / "histograms" / "global")
+            return True
+        except FileNotFoundError:
+            return False
 
     @property
     def has_mvt(self) -> bool:
@@ -139,27 +144,23 @@ class Dataset:
     @property
     def histogram_resolution(self) -> int | None:
         hist_dir = self._root / "histograms"
-        for metadata_path in (hist_dir / "global_prefix.json", hist_dir / "global.json"):
-            if metadata_path.exists():
-                try:
-                    with open(metadata_path) as handle:
-                        metadata = json.load(handle)
-                    grid_size = metadata.get("grid_size")
-                    if grid_size is not None:
-                        return int(grid_size)
-                except Exception:
-                    pass
+        metadata_path = hist_dir / "global.json"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as handle:
+                    metadata = json.load(handle)
+                grid_size = metadata.get("grid_size")
+                if grid_size is not None:
+                    return int(grid_size)
+            except Exception:
+                pass
 
-        import numpy as np
-
-        for array_path in (hist_dir / "global_prefix.npy", hist_dir / "global.npy"):
-            if array_path.exists():
-                try:
-                    arr = np.load(array_path, allow_pickle=False)
-                    if arr.ndim >= 2:
-                        return int(arr.shape[0])
-                except Exception:
-                    pass
+        try:
+            arr = load_histogram(hist_dir)
+            if arr.ndim >= 2:
+                return int(arr.shape[0])
+        except Exception:
+            pass
         return None
 
     def _tile_counts_by_zoom_mapping(self) -> dict[int, int]:

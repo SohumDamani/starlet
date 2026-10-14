@@ -20,6 +20,7 @@ import pytest
 from shapely.geometry import Point, Polygon, MultiPolygon, box
 from shapely import wkb
 
+from starlet._internal.histogram.io import save_numpy_array
 
 @pytest.fixture
 def temp_dir() -> Iterator[Path]:
@@ -220,8 +221,7 @@ def sample_dataset_dir(temp_dir, sample_tile_directory, sample_histogram):
 
     Creates:
     - parquet_tiles/
-    - histograms/global.npy
-    - histograms/global_prefix.npy
+    - histograms/global.npy.gz
     - histograms/global.json
     - stats/attributes.json
     """
@@ -238,13 +238,10 @@ def sample_dataset_dir(temp_dir, sample_tile_directory, sample_histogram):
     # Create histograms
     hist_dir = dataset_dir / "histograms"
     hist_dir.mkdir()
-    np.save(hist_dir / "global.npy", sample_histogram, allow_pickle=False)
-
-    prefix = sample_histogram.cumsum(axis=0).cumsum(axis=1)
-    np.save(hist_dir / "global_prefix.npy", prefix, allow_pickle=False)
+    save_numpy_array(hist_dir / "global.npy.gz", sample_histogram)
 
     hist_meta = {
-        "filename": "global.npy",
+        "filename": "global.npy.gz",
         "grid_size": sample_histogram.shape[0],
         "shape": list(sample_histogram.shape),
         "sum": float(sample_histogram.sum()),

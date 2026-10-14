@@ -13,6 +13,7 @@ from shapely import from_wkb, get_coordinates
 from pyproj import Transformer
 
 from starlet._internal.executor import create_process_executor
+from starlet._internal.histogram.io import save_numpy_array
 from starlet._internal.tiling.crs import WGS84_CRS, geoparquet_crs
 from starlet._internal.tiling.datasource import GeoParquetSource
 
@@ -190,11 +191,10 @@ def _sum_all_tiles(tile_hists: List[np.ndarray], outdir: Path, dtype="float64") 
             )
         total += hist
 
-    global_path = outdir / "global.npy"
-    np.save(global_path, total, allow_pickle=False)
+    global_path = save_numpy_array(outdir / "global.npy.gz", total)
 
     global_json = {
-        "filename": "global.npy",
+        "filename": global_path.name,
         "dtype": str(total.dtype),
         "grid_size": int(total.shape[0]),
         "shape": list(total.shape),
@@ -206,27 +206,9 @@ def _sum_all_tiles(tile_hists: List[np.ndarray], outdir: Path, dtype="float64") 
     with open(outdir / "global.json", "w") as f:
         json.dump(global_json, f, indent=2)
 
-    prefix = total.cumsum(axis=0).cumsum(axis=1)
-
-    prefix_path = outdir / "global_prefix.npy"
-    np.save(prefix_path, prefix, allow_pickle=False)
-
-    prefix_json = {
-        "filename": "global_prefix.npy",
-        "dtype": str(prefix.dtype),
-        "grid_size": int(prefix.shape[0]),
-        "shape": list(prefix.shape),
-        "crs": "EPSG:3857",
-        "bbox": list(GLOBAL_BBOX),
-        "desc": "2D prefix sum histogram"
-    }
-    with open(outdir / "global_prefix.json", "w") as f:
-        json.dump(prefix_json, f, indent=2)
-
     logger.info(f"Wrote global histogram: {global_path}")
-    logger.info(f"Wrote global prefix sum histogram: {prefix_path}")
 
-    return prefix_path
+    return global_path
 
 
 # ---------------------------------------------------------------------------

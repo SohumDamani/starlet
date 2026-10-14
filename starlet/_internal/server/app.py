@@ -22,6 +22,13 @@ from .download_service import DatasetFeatureService
 logger = logging.getLogger(__name__)
 
 
+def _parse_attributes_param(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    attributes = tuple(part.strip() for part in value.split(",") if part.strip())
+    return attributes if attributes else None
+
+
 def create_app(
     data_dir: str,
     cache_size: int | None = None,
@@ -100,8 +107,9 @@ def create_app(
         t0 = perf_counter()
         tiler = get_tiler(dataset)
         tile_info: dict[str, object] = {}
+        attributes = _parse_attributes_param(request.args.get("attributes"))
         try:
-            data = tiler.get_tile(z, x, y, output=tile_info)
+            data = tiler.get_tile(z, x, y, output=tile_info, attributes=attributes)
         except FileNotFoundError as e:
             logger.warning("[TileRequest] %s/%d/%d/%d not found: %s", dataset, z, x, y, e)
             return {"error": str(e)}, 404

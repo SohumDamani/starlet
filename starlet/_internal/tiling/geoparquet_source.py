@@ -127,7 +127,6 @@ class GeoParquetSource(DataSource):
         path: str,
         *,
         geom_col: str = "geometry",
-        sample_ratio: float,
         sample_cap: Optional[int],
         seed: int,
         workers: Optional[int],
@@ -157,7 +156,6 @@ class GeoParquetSource(DataSource):
                     path,
                     split,
                     geom_col,
-                    sample_ratio,
                     sample_caps[index],
                     seed + index,
                 )
@@ -232,7 +230,6 @@ def _read_geoparquet_spatial_sample(
     path: str,
     *,
     geom_col: str,
-    sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
     geoparquet_workers: Optional[int],
@@ -240,7 +237,6 @@ def _read_geoparquet_spatial_sample(
     return GeoParquetSource.read_spatial_sample(
         path,
         geom_col=geom_col,
-        sample_ratio=sample_ratio,
         sample_cap=sample_cap,
         seed=seed,
         workers=geoparquet_workers,
@@ -251,15 +247,12 @@ def _read_geoparquet_split_spatial_sample(
     path: str,
     split: GeoParquetSplit,
     geom_col: str,
-    sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
 ) -> SpatialSample:
     """Read one GeoParquet row-group split for parallel spatial sampling."""
     source = GeoParquetSource(path, geometry_only=True, geom_col=geom_col)
     rng = np.random.default_rng(seed)
-    mins = np.array([+np.inf, +np.inf], dtype=np.float64)
-    maxs = np.array([-np.inf, -np.inf], dtype=np.float64)
     x_sample: List[float] = []
     y_sample: List[float] = []
     n_seen = 0
@@ -280,22 +273,11 @@ def _read_geoparquet_split_spatial_sample(
         for geom in geometries:
             if geom is None or geom.is_empty:
                 continue
-            minx, miny, maxx, maxy = geom.bounds
-            if minx < mins[0]:
-                mins[0] = minx
-            if miny < mins[1]:
-                mins[1] = miny
-            if maxx > maxs[0]:
-                maxs[0] = maxx
-            if maxy > maxs[1]:
-                maxs[1] = maxy
-
             centroid = geom.centroid
             n_seen += 1
             _reservoir_add(
                 rng=rng,
                 sample_cap=sample_cap,
-                sample_ratio=sample_ratio,
                 x_sample=x_sample,
                 y_sample=y_sample,
                 n_seen=n_seen,
@@ -306,8 +288,6 @@ def _read_geoparquet_split_spatial_sample(
     return _spatial_sample_from_state(
         x_sample=x_sample,
         y_sample=y_sample,
-        mins=mins,
-        maxs=maxs,
         n_seen=n_seen,
         batches_read=n_batches,
     )

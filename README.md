@@ -1,7 +1,8 @@
 # Starlet
 
 **Turn large geospatial datasets into fast, interactive maps.** Starlet
-partitions a GeoParquet / GeoJSON file into spatial tiles, generates
+partitions a geospatial dataset (GeoParquet, GeoJSON, CSV, vector files, GPX
+tracks, or GeoLife PLT trajectories) into spatial tiles, generates
 [Mapbox Vector Tiles](https://github.com/mapbox/vector-tile-spec), and serves
 them over HTTP with a built-in web viewer — all from a single command-line tool.
 
@@ -23,6 +24,12 @@ This installs the `starlet` command-line tool. Check it:
 
 ```bash
 starlet --version
+```
+
+For local development and testing, install the project with dev dependencies:
+
+```bash
+pip install -e ".[dev]"
 ```
 
 ## Quick start
@@ -70,6 +77,7 @@ full option list.
 | `--threshold` | build, mvt | `0` | Minimum feature count for a tile to be generated |
 | `--feature-capacity` | build, mvt | `10000` | Max features *larger than a pixel* kept per tile (see below) |
 | `--tile-attributes` | build, mvt, serve | `all` | Attribute columns written into tiles: `all`, `none`, or `name,class,…` (see below) |
+| `--mvt-memory-budget` | build, mvt | `auto` | Total memory target for concurrent MVT mappers, e.g. `24gb`, or `none` |
 | `--dir` | serve, mvt, info | required | Dataset directory (or the root of several, for `serve`) |
 | `--port` | serve | `8765` | Port to bind the server |
 

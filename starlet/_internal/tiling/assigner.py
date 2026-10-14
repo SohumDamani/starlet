@@ -90,8 +90,8 @@ class RSGroveAssigner:
        requiring the least area expansion is chosen.
 
     The class can be constructed either directly (with a pre-built partitioner)
-    or via :meth:`from_sample_and_mbr`, which consumes a prepared centroid sample
-    and global MBR to build the R*-tree partition index.
+    or via :meth:`from_sample_and_bounds`, which consumes a prepared centroid
+    sample and a bounds envelope to build the R*-tree partition index.
     """
 
     def __init__(
@@ -110,37 +110,37 @@ class RSGroveAssigner:
         return self._geom_col
 
     @classmethod
-    def from_sample_and_mbr(
+    def from_sample_and_bounds(
         cls,
         sample_points: np.ndarray,
-        mbr: EnvelopeNDLite,
+        bounds: EnvelopeNDLite,
         num_partitions: int,
         geom_col: str = "geometry",
     ) -> "RSGroveAssigner":
-        """Build an RSGrovePartitioner from prepared sample points and MBR."""
+        """Build an RSGrovePartitioner from prepared sample points and bounds."""
         sample_points = np.asarray(sample_points, dtype=np.float64)
         if sample_points.ndim != 2:
             raise ValueError("sample_points must be a 2-D array with shape (D, N)")
         if sample_points.shape[1] == 0:
             raise ValueError("sample_points must contain at least one sampled point")
-        if mbr.getCoordinateDimension() != sample_points.shape[0]:
+        if bounds.getCoordinateDimension() != sample_points.shape[0]:
             raise ValueError(
-                "sample_points dimension does not match the MBR dimension: "
-                f"{sample_points.shape[0]} != {mbr.getCoordinateDimension()}"
+                "sample_points dimension does not match the bounds dimension: "
+                f"{sample_points.shape[0]} != {bounds.getCoordinateDimension()}"
             )
 
         logger.info(
-            "RSGroveAssigner.from_sample_and_mbr: num_partitions=%d sample_size=%d geom_col=%s",
+            "RSGroveAssigner.from_sample_and_bounds: num_partitions=%d sample_size=%d geom_col=%s",
             num_partitions,
             sample_points.shape[1],
             geom_col,
         )
 
         part = RSGrovePartitioner()
-        part.construct(mbr, sample_points, None, int(num_partitions))
+        part.construct(bounds, sample_points, None, int(num_partitions))
 
         logger.info("Partitioner built: partitions=%d", part.numPartitions())
-        return cls(part, mbr.copy(), geom_col=geom_col)
+        return cls(part, bounds.copy(), geom_col=geom_col)
 
     def partition_by_tile(self, tbl: pa.Table) -> pa.Table:
         """Assign each row to a partition and return aligned partition IDs.

@@ -91,7 +91,8 @@ the specific job you are running:
 
 - input paths such as `--input`
 - dataset/output paths such as `--outdir` and `--dir`
-- source schema details such as `--csv-x-col`, `--csv-y-col`, and `--csv-wkt-col`
+- source schema details such as `--csv-x-col`, `--csv-y-col`, `--csv-wkt-col`,
+  `--csv-x-index`, `--csv-y-index`, and `--csv-wkt-index`
 - run-specific controls such as `--covering-bbox` and `--seed`
 
 ## Current Command Surface

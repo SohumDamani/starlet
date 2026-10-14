@@ -6,6 +6,9 @@ import importlib
 
 import starlet
 from starlet.api import AsyncDatasetHandle
+from starlet._internal.server.download_service import DatasetFeatureService
+from starlet._internal.tiling.csv_source import CSVSource
+from starlet._internal.tiling.geojson_source import GeoJSONSource
 
 
 def test_list_datasets(sample_dataset_dir):
@@ -23,6 +26,109 @@ def test_process_wide_temp_dir_can_be_configured(temp_dir):
         assert custom_temp.is_dir()
     finally:
         starlet.set_temp_dir(str(previous) if previous is not None else None)
+
+
+def test_geojson_tiling_preserves_nested_properties_in_geojson_export(tmp_path, monkeypatch):
+    original_batches = GeoJSONSource._iter_feature_batches_for_split
+    schema_scans = 0
+
+    def tracked_batches(self, split):
+        nonlocal schema_scans
+        if split is None:
+            schema_scans += 1
+        yield from original_batches(self, split)
+
+    monkeypatch.setattr(GeoJSONSource, "_iter_feature_batches_for_split", tracked_batches)
+
+    source = tmp_path / "cemetery_tags.geojson"
+    dataset = tmp_path / "cemetery_dataset"
+    source.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": 1,
+                            "tagsMap": {
+                                "landuse": "cemetery",
+                                "type": "multipolygon",
+                            },
+                        },
+                        "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": 2,
+                            "tagsMap": {"name": "Oak Hill"},
+                        },
+                        "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    starlet.tile(str(source), str(dataset), partition_size=1, parallelism=1)
+
+    assert schema_scans == 0
+
+    body = "".join(
+        DatasetFeatureService(tmp_path).get_features_stream("cemetery_dataset", "geojson")
+    )
+    exported = json.loads(body)
+    tags = [feature["properties"]["tagsMap"] for feature in exported["features"]]
+
+    assert {"landuse": "cemetery", "type": "multipolygon"} in tags
+    assert {"name": "Oak Hill"} in tags
+
+    sample = DatasetFeatureService(tmp_path).get_sample_record(
+        "cemetery_dataset",
+        "-1,-1,2,2",
+        include_geometry=True,
+    )
+    assert sample is not None
+    assert isinstance(sample["properties"]["tagsMap"], dict)
+
+    public_sample = starlet.get_sample_record(dataset, (-1, -1, 2, 2))
+    assert public_sample is not None
+    assert isinstance(public_sample["tagsMap"], dict)
+    assert public_sample["tagsMap"] in tags
+
+
+def test_csv_tiling_reuses_schema_from_sampling(tmp_path, monkeypatch):
+    source = tmp_path / "mixed.csv"
+    dataset = tmp_path / "mixed_dataset"
+    source.write_text(
+        "id,x,y,units,active\n"
+        "1,0,0,10,true\n"
+        "2,1,1,2.5,false\n"
+    )
+
+    original_inference = CSVSource.iter_tables_for_schema_inference
+    full_schema_scans = 0
+
+    def tracked_inference(self, split=None):
+        nonlocal full_schema_scans
+        if split is None:
+            full_schema_scans += 1
+        yield from original_inference(self, split)
+
+    monkeypatch.setattr(CSVSource, "iter_tables_for_schema_inference", tracked_inference)
+
+    starlet.tile(
+        str(source),
+        str(dataset),
+        partition_size=1,
+        parallelism=1,
+        csv_x_col="x",
+        csv_y_col="y",
+    )
+
+    assert full_schema_scans == 0
 
 
 def test_import_auto_loads_config_once(tmp_path, monkeypatch):
@@ -47,6 +153,25 @@ temp_dir = "{temp_root}"
 
         assert get_loaded_config_path() == tmp_path / "starlet.toml"
         assert get_temp_dir() == temp_root
+    finally:
+        _reset_loaded_config_for_tests()
+
+
+def test_get_config_returns_current_loaded_config_copy():
+    from starlet._internal.config import _reset_loaded_config_for_tests, set_loaded_config
+
+    _reset_loaded_config_for_tests()
+    set_loaded_config({"global": {"parallelism": 3}, "serve": {"cache_size": 12}})
+
+    try:
+        config = starlet.get_config()
+
+        assert config["global"]["parallelism"] == 3
+        assert config["serve"]["cache_size"] == 12
+        assert config["mvt"]["extent"] == 4096
+
+        config["serve"]["cache_size"] = 99
+        assert starlet.get_config()["serve"]["cache_size"] == 12
     finally:
         _reset_loaded_config_for_tests()
 
@@ -197,11 +322,13 @@ def test_vector_tiler_only_caches_generated_tiles(temp_dir, monkeypatch):
     tiler = VectorTiler(str(dataset_dir), memory_cache_size=8)
 
     assert tiler.get_tile(0, 0, 0) == disk_bytes
-    assert (0, 0, 0) not in tiler.cache.store
+    assert (0, 0, 0, None) not in tiler.cache.store
 
     generated_bytes = b"generated-tile"
+    captured = {}
 
     def fake_generate_single_mvt_tile(dataset_root, tile_coords, **kwargs):
+        captured.update(kwargs)
         return generated_bytes
 
     monkeypatch.setattr(
@@ -210,7 +337,60 @@ def test_vector_tiler_only_caches_generated_tiles(temp_dir, monkeypatch):
     )
 
     assert tiler.get_tile(1, 0, 0) == generated_bytes
-    assert tiler.cache.store[(1, 0, 0)] == generated_bytes
+    assert tiler.cache.store[(1, 0, 0, None)] == generated_bytes
+    assert captured["attributes"] is None
+
+
+def test_get_tile_returns_prebuilt_tile_when_attributes_are_requested(temp_dir, monkeypatch):
+    dataset_dir = temp_dir / "tile_dataset"
+    (dataset_dir / "parquet_tiles").mkdir(parents=True)
+    tile_path = dataset_dir / "mvt" / "0" / "0" / "0.mvt"
+    tile_path.parent.mkdir(parents=True)
+    disk_bytes = b"disk-tile"
+    tile_path.write_bytes(disk_bytes)
+
+    def fail_generate_single_mvt_tile(*args, **kwargs):
+        raise AssertionError("prebuilt tiles should be returned without generation")
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.generate_single_mvt_tile",
+        fail_generate_single_mvt_tile,
+    )
+
+    output = {}
+    data = starlet.get_tile(dataset_dir, 0, 0, 0, output=output, attributes=["name", "id"])
+
+    assert data == disk_bytes
+    assert output["source"] == "disk"
+    assert output["generation"] == "read_from_disk"
+    assert "attributes" not in output
+
+
+def test_get_tile_forwards_attribute_whitelist_on_generated_miss(temp_dir, monkeypatch):
+    dataset_dir = temp_dir / "tile_dataset"
+    (dataset_dir / "parquet_tiles").mkdir(parents=True)
+
+    generated_bytes = b"generated-tile"
+    captured = {}
+
+    def fake_generate_single_mvt_tile(dataset_root, tile_coords, **kwargs):
+        captured["dataset_root"] = dataset_root
+        captured["tile_coords"] = tile_coords
+        captured.update(kwargs)
+        return generated_bytes
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.generate_single_mvt_tile",
+        fake_generate_single_mvt_tile,
+    )
+
+    output = {}
+    data = starlet.get_tile(dataset_dir, 0, 0, 0, output=output, attributes=["name", "id"])
+
+    assert data == generated_bytes
+    assert output["source"] == "generated"
+    assert output["attributes"] == ["id", "name"]
+    assert captured["attributes"] == ("id", "name")
 
 
 def test_query_dataset_uses_indexed_tile(temp_dir, sample_parquet_file):
@@ -240,6 +420,10 @@ def test_query_dataset_hides_internal_tile_columns(temp_dir, sample_parquet_tabl
         "_tile_id",
         pa.array([0] * sample_parquet_table.num_rows, type=pa.int64()),
     )
+    internal_table = internal_table.append_column(
+        "_id",
+        pa.array(list(range(sample_parquet_table.num_rows)), type=pa.int64()),
+    )
     for col in ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"):
         internal_table = internal_table.append_column(
             col,
@@ -250,7 +434,7 @@ def test_query_dataset_hides_internal_tile_columns(temp_dir, sample_parquet_tabl
     result = next(starlet.query_dataset(dataset_dir, (0, 0, 15, 15)))
     record = starlet.get_sample_record(dataset_dir, (0, 0, 15, 15))
 
-    internal_columns = {"_tile_id", "_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"}
+    internal_columns = {"_id", "_tile_id", "_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"}
     assert internal_columns.isdisjoint(result.columns)
     assert record is not None
     assert internal_columns.isdisjoint(record)

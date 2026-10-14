@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from time import perf_counter
-from typing import Any, MutableMapping
+from typing import Any, MutableMapping, Sequence
 import gzip
 
 from starlet._internal.config import config_value
@@ -79,9 +79,18 @@ class VectorTiler:
             return None
         return _decode_pmtiles_tile(tile_bytes, self._pmtiles_header)
 
-    def get_tile(self, z: int, x: int, y: int, output: TileInfo | None = None) -> bytes:
+    def get_tile(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        output: TileInfo | None = None,
+        *,
+        attributes: Sequence[str] | None = None,
+    ) -> bytes:
         t0 = perf_counter()
-        key = (z, x, y)
+        attribute_key = _normalize_attribute_key(attributes)
+        key = (z, x, y, attribute_key)
 
         cached = self.cache.get(key)
         if cached is not None:
@@ -134,6 +143,7 @@ class VectorTiler:
             extent=self.extent,
             buffer=self.buffer,
             tile_attributes=self.tile_attributes,
+            attributes=attribute_key,
         )
         _update_output(
             output,
@@ -142,6 +152,7 @@ class VectorTiler:
             feature_capacity=self.feature_capacity,
             extent=self.extent,
             buffer=self.buffer,
+            attributes=list(attribute_key) if attribute_key is not None else None,
             elapsed_ms=(perf_counter() - t0) * 1000,
         )
 
@@ -153,6 +164,12 @@ class VectorTiler:
         # e.g. with threshold=0 to materialise every non-empty tile).
         self.cache.put(key, tile_bytes)
         return tile_bytes
+
+
+def _normalize_attribute_key(attributes: Sequence[str] | None) -> tuple[str, ...] | None:
+    if attributes is None:
+        return None
+    return tuple(sorted({str(attribute).strip() for attribute in attributes if str(attribute).strip()}))
 
 def _decode_pmtiles_tile(tile_bytes: bytes, header: dict[str, Any] | None) -> bytes:
     if not header:

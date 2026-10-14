@@ -28,7 +28,7 @@ make server   # http://127.0.0.1:5000
 | `GET` | `/datasets.json` | Search datasets by name |
 | `GET` | `/datasets/<dataset>.json` | Dataset metadata |
 | `GET` | `/datasets/<dataset>.html` | Dataset detail page |
-| `GET` | `/<dataset>/<z>/<x>/<y>.mvt` | Mapbox Vector Tile |
+| `GET` | `/<dataset>/<z>/<x>/<y>.mvt` | Mapbox Vector Tile. Optional `attributes=name,id` limits generated tiles to those non-geometry attributes. |
 | `GET` | `/datasets/<dataset>/features.<fmt>` | Download features (csv/geojson) |
 | `POST` | `/datasets/<dataset>/features.<fmt>` | Download with geometry filter |
 | `GET` | `/datasets/<dataset>/features/sample.json` | Sample non-geometry attributes |

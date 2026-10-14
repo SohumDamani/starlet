@@ -20,8 +20,8 @@ log_level = "DEBUG"
 partition_size = "256mb"
 sort = "hilbert"
 compression = "gzip"
+intermediate_compression = "none"
 sample_cap = 123
-sample_ratio = 0.5
 csv_split_size = "64mb"
 grid_size = 1024
 dtype = "float32"
@@ -60,8 +60,8 @@ sfc_bits = 20
     assert captured["partition_size"] == 256 * 1024 * 1024
     assert captured["sort"] == "hilbert"
     assert captured["compression"] == "gzip"
+    assert captured["intermediate_compression"] == "none"
     assert captured["sample_cap"] == 123
-    assert captured["sample_ratio"] == 0.5
     assert captured["csv_split_size"] == 64 * 1024 * 1024
     assert captured["parallelism"] == 6
     assert captured["grid_size"] == 1024
@@ -82,6 +82,7 @@ zoom = 5
 threshold = 777
 pmtiles = true
 feature_capacity = 333
+mvt_memory_budget = "8gb"
 extent = 2048
 buffer = 64
 """.strip()
@@ -89,7 +90,7 @@ buffer = 64
 
     captured = {}
 
-    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, extent, buffer, tile_attributes=None):
+    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, mvt_memory_budget, extent, buffer, tile_attributes=None):
         captured.update(
             tile_dir=tile_dir,
             zoom=zoom,
@@ -100,6 +101,7 @@ buffer = 64
             parallelism=parallelism,
             temp_dir=temp_dir,
             feature_capacity=feature_capacity,
+            mvt_memory_budget=mvt_memory_budget,
             extent=extent,
             buffer=buffer,
         )
@@ -128,6 +130,7 @@ buffer = 64
     assert captured["pmtiles_compression"] == "gzip"
     assert captured["parallelism"] == 4
     assert captured["feature_capacity"] == 333
+    assert captured["mvt_memory_budget"] == "8gb"
     assert captured["extent"] == 2048
     assert captured["buffer"] == 64
 
@@ -171,6 +174,7 @@ pmtiles_compression = "brotli"
     assert result.exit_code == 0
     assert captured["pmtiles"] is True
     assert captured["pmtiles_compression"] == "brotli"
+    assert captured["intermediate_compression"] == "gzip"
 
 
 def test_serve_command_uses_config_host_port_and_cache(tmp_path, monkeypatch):

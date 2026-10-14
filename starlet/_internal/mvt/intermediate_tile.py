@@ -32,11 +32,13 @@ import math
 import random
 import struct
 import zlib
+from datetime import date, datetime, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import mapbox_vector_tile
+import numpy as np
 import pyarrow as pa
 import shapely
 from shapely.affinity import affine_transform
@@ -328,7 +330,7 @@ class IntermediateVectorTile:
                 ),
                 "properties": pa.array(
                     [
-                        json.dumps(entry[2].properties, separators=(",", ":"))
+                        json.dumps(entry[2].properties, separators=(",", ":"), default=_json_safe_value)
                         for entry in entries
                     ],
                     type=pa.string(),
@@ -402,7 +404,7 @@ class IntermediateVectorTile:
                 out.append(
                     {
                         "geometry": geometry,
-                        "properties": {} if bare else self._select_properties(feature.properties),
+                        "properties": {} if bare else _mvt_properties(self._select_properties(feature.properties)),
                     }
                 )
         out.extend(self._packed_dots(poly_dots, line_dots))
@@ -472,3 +474,48 @@ def _base_kind(geometry: Any) -> str:
     if "LineString" in kinds or "LinearRing" in kinds:
         return "LineString"
     return "Point"
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, datetime | date | time):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
+
+
+def _mvt_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, value in properties.items():
+        if value is not None:
+            for key, flattened_value in _flatten_property_items(name, value):
+                out[key] = _mvt_property_value(flattened_value)
+    return out
+
+
+def _flatten_property_items(name: str, value: Any):
+    if isinstance(value, dict):
+        for key, item_value in value.items():
+            if item_value is not None:
+                yield from _flatten_property_items(f"{name}.{key}", item_value)
+        return
+
+    if _is_map_entries(value):
+        for key, item_value in value:
+            if item_value is not None:
+                yield from _flatten_property_items(f"{name}.{key}", item_value)
+        return
+
+    yield name, value
+
+
+def _is_map_entries(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    )
+
+
+def _mvt_property_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)

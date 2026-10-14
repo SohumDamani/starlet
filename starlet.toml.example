@@ -28,11 +28,12 @@ sort = "zorder"
 # Compression codec for parquet output.
 compression = "zstd"
 
+# Compression for two-stage shuffle intermediate files written by mappers
+# before the reduce stage merges them: "gzip" or "none".
+intermediate_compression = "gzip"
+
 # Reservoir sample size used during partitioning.
 sample_cap = 10000
-
-# Bernoulli sample ratio used during partitioning.
-sample_ratio = 1.0
 
 # Target byte size for CSV source splits.
 csv_split_size = "32mb"
@@ -62,6 +63,10 @@ feature_capacity = 10000
 tile_attributes = "all"
 # Douglas-Peucker tolerance in tile units; "auto" = a quarter of a display pixel
 simplify_tolerance = "auto"
+
+# Total memory target for all concurrent MVT mapper workers. "auto" uses a
+# fraction of currently available system memory; set to "none" to disable.
+mvt_memory_budget = "auto"
 
 # Vector tile extent.
 extent = 4096

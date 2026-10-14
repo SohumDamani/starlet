@@ -25,6 +25,7 @@ from starlet._internal.histogram.hist_pyramid import (
     HistConfig,
     build_histograms_for_dir,
 )
+from starlet._internal.histogram.io import load_numpy_array
 from starlet._internal.tiling.datasource import GeoParquetSource
 
 
@@ -131,10 +132,8 @@ class TestHistogramBuilding:
         )
 
         # Check output files exist
-        assert (out_dir / "global.npy").exists()
-        assert (out_dir / "global_prefix.npy").exists()
+        assert (out_dir / "global.npy.gz").exists()
         assert (out_dir / "global.json").exists()
-        assert (out_dir / "global_prefix.json").exists()
 
     @pytest.mark.slow
     def test_histogram_dimensions(self, sample_tile_directory, temp_dir):
@@ -148,7 +147,7 @@ class TestHistogramBuilding:
             grid_size=grid_size
         )
 
-        hist = np.load(out_dir / "global.npy")
+        hist = load_numpy_array(out_dir / "global")
         assert hist.shape == (grid_size, grid_size)
 
     @pytest.mark.slow
@@ -162,14 +161,15 @@ class TestHistogramBuilding:
             grid_size=64
         )
 
-        hist = np.load(out_dir / "global.npy")
-        prefix = np.load(out_dir / "global_prefix.npy")
+        hist = load_numpy_array(out_dir / "global")
 
-        # Manually compute prefix sum
-        expected_prefix = hist.cumsum(axis=0).cumsum(axis=1)
+        prefix = hist.cumsum(axis=0).cumsum(axis=1)
 
         # Should match
-        np.testing.assert_array_almost_equal(prefix, expected_prefix)
+        np.testing.assert_array_almost_equal(
+            prefix,
+            hist.cumsum(axis=0).cumsum(axis=1),
+        )
 
     @pytest.mark.slow
     def test_histogram_metadata(self, sample_tile_directory, temp_dir):
@@ -204,7 +204,7 @@ class TestHistogramBuilding:
             grid_size=64
         )
 
-        hist = np.load(out_dir / "global.npy")
+        hist = load_numpy_array(out_dir / "global")
 
         with open(out_dir / "global.json", "r") as f:
             meta = json.load(f)
@@ -300,7 +300,7 @@ class TestEdgeCases:
             grid_size=4  # Very small
         )
 
-        hist = np.load(out_dir / "global.npy")
+        hist = load_numpy_array(out_dir / "global")
         assert hist.shape == (4, 4)
 
     @pytest.mark.slow
@@ -314,7 +314,7 @@ class TestEdgeCases:
             grid_size=1024  # Moderate size
         )
 
-        hist = np.load(out_dir / "global.npy")
+        hist = load_numpy_array(out_dir / "global")
         assert hist.shape == (1024, 1024)
 
     @pytest.mark.slow
@@ -329,5 +329,5 @@ class TestEdgeCases:
             dtype="float32"
         )
 
-        hist = np.load(out_dir / "global.npy")
+        hist = load_numpy_array(out_dir / "global")
         assert hist.dtype == np.float32

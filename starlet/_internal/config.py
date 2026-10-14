@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -23,8 +24,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "partition_size": None,
         "sort": "zorder",
         "compression": "zstd",
+        "intermediate_compression": "gzip",
         "sample_cap": 10_000,
-        "sample_ratio": 1.0,
         "csv_split_size": "32mb",
         "grid_size": 4096,
         "dtype": "float64",
@@ -41,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "python_pyramid": "pull",
         "batch_row_group_cache": 32,
         "push_max_tiles": 1024,
+        "mvt_memory_budget": "auto",
         "extent": 4096,
         "buffer": 256,
         "pmtiles_compression": "gzip",
@@ -261,7 +263,22 @@ def _read_config_file(path: Path) -> dict[str, Any]:
         loaded = tomllib.load(handle)
     if not isinstance(loaded, dict):
         raise ValueError(f"Invalid Starlet config file: {path}")
-    return loaded
+    return _expand_env(loaded)
+
+
+def _expand_env(value: Any) -> Any:
+    """Expand ``~`` and environment variables in strings from a config file.
+
+    Applied only to values parsed out of the TOML file, not to values
+    passed on the command line (the shell already expands those).
+    """
+    if isinstance(value, str):
+        return os.path.expandvars(os.path.expanduser(value))
+    if isinstance(value, dict):
+        return {key: _expand_env(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(item) for item in value]
+    return value
 
 
 def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> None:

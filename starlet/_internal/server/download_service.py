@@ -256,7 +256,7 @@ class FeatureStreamer:
             else:
                 # Regular properties
                 if value is not None:
-                    properties[col] = value
+                    properties[col] = _geojson_property_value(value)
         
         feature = {
             'type': 'Feature',
@@ -264,6 +264,23 @@ class FeatureStreamer:
             'geometry': geometry
         }
         return feature
+
+
+def _geojson_property_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _geojson_property_value(item) for key, item in value.items()}
+    if _is_map_entries(value):
+        return {key: _geojson_property_value(item_value) for key, item_value in value}
+    if isinstance(value, list):
+        return [_geojson_property_value(item) for item in value]
+    return value
+
+
+def _is_map_entries(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    )
 
 
 class DatasetFeatureService:
@@ -324,6 +341,35 @@ class DatasetFeatureService:
         # Stream features
         streamer = FeatureStreamer(dataset_path)
         return streamer.stream_features(query_mbr, handler, filter_geometry=filter_geom)
+
+    def get_sample_record(
+        self,
+        dataset_name: str,
+        mbr_string: str,
+        *,
+        include_geometry: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        query_mbr = BoundingBox.from_string(mbr_string)
+        dataset_path = self.data_root / dataset_name
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Dataset not found: {dataset_name}")
+
+        from starlet.api import query_dataset
+
+        bounds = (
+            query_mbr.minx,
+            query_mbr.miny,
+            query_mbr.maxx,
+            query_mbr.maxy,
+        )
+        for batch in query_dataset(dataset_path, bounds, batch_size=1):
+            if batch.empty:
+                continue
+            feature = FeatureStreamer._row_to_feature(batch.iloc[0])
+            if include_geometry:
+                return feature
+            return feature["properties"]
+        return None
     
     def get_mime_type(self, format: str) -> str:
         """Get MIME type for format."""
