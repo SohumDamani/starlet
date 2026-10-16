@@ -249,7 +249,10 @@ class RowGroupCache:
             stats = None
             if has_bbox:
                 md = pf.metadata
-                cols = [pf.schema_arrow.get_field_index(c) for c in BBOX_COLS]
+                # Row-group statistics are indexed by Parquet leaf column, which differs
+                # from the Arrow field index once a nested (struct/map/list) column exists.
+                leaf_index = {md.schema.column(i).path: i for i in range(md.num_columns)}
+                cols = [leaf_index[c] for c in BBOX_COLS]
                 mins = np.full((md.num_row_groups, 2), -np.inf)
                 maxs = np.full((md.num_row_groups, 2), np.inf)
                 for rg in range(md.num_row_groups):
