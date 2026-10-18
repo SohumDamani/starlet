@@ -12,7 +12,10 @@ import multiprocessing
 import os
 from pathlib import Path
 import random
-import resource
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None
 import shutil
 import sys
 import tempfile
@@ -849,6 +852,29 @@ def _metric(value: float | None) -> str:
 
 def _process_rss_mib() -> tuple[float | None, float | None]:
     """Return current and peak RSS for lightweight worker diagnostics."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (name, ctypes.c_size_t) for name in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                    "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+                    "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+                )
+            ]
+
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        query = ctypes.WinDLL("psapi", use_last_error=True).GetProcessMemoryInfo
+        query.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessMemoryCounters), wintypes.DWORD]
+        query.restype = wintypes.BOOL
+        if query(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return counters.WorkingSetSize / _MIB, counters.PeakWorkingSetSize / _MIB
+        return None, None
     current = None
     if sys.platform.startswith("linux"):
         try:
@@ -857,6 +883,8 @@ def _process_rss_mib() -> tuple[float | None, float | None]:
         except (OSError, ValueError, IndexError):
             pass
 
+    if resource is None:
+        return current, None
     try:
         peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
         # Linux reports KiB; macOS and the BSDs report bytes.
