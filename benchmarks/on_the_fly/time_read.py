@@ -9,8 +9,12 @@ Cold: a new index and an empty row-group cache for every tile. OS file cache: wa
 """
 import argparse
 import csv
+import json
+import platform
+import subprocess
 import random
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +63,17 @@ def read_tile(index, cache, frame):
             lon0s.append(a[rows]); lat0s.append(b[rows]); lon1s.append(c[rows]); lat1s.append(d[rows]); crcs.append(crc[rows])
 
     return records_read, (lon0s, lat0s, lon1s, lat1s, crcs), (tables, geom_cols, attr_cols, part_of, row_of)
+
+
+def bytes_read_of(index, cache, frame):
+    """Size on disk of the row groups this tile reads (same choice as read_tile, replayed after the timers)."""
+    total = 0
+    for path in index.find_intersecting_files(frame.query_lonlat):
+        md = cache.file_info(path)[0].metadata
+        for rg in cache.candidate_row_groups(path, frame.query_lonlat):
+            r = md.row_group(rg)
+            total += sum(r.column(i).total_compressed_size for i in range(r.num_columns))
+    return total
 
 
 def pick_tile(frame, pieces, source):
@@ -155,30 +170,54 @@ def encode_tile(frame, source, selection, decoded, tgeoms):
     return layer.encode_tile(), layer.feature_count
 
 
+def write_run_info(args, n_tiles, cpu_load):
+    """Save what produced these results: date, code version, dataset and settings."""
+    git = lambda *a: subprocess.run(["git", *a], cwd=HERE, capture_output=True, text=True).stdout.strip()
+    info = {
+        "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "git_commit": git("rev-parse", "--short", "HEAD"),
+        "git_uncommitted_changes": bool(git("status", "--porcelain", "--", "../../starlet", ".")),
+        "dataset": str(Path(args.dataset).resolve()), "name": args.name,
+        "tiles": n_tiles, "runs": args.runs, "verify": args.verify,
+        "feature_capacity": FEATURE_CAPACITY, "extent": EXTENT, "buffer": BUFFER,
+        "row_group_cache": int(config_value("mvt", "row_group_cache")),
+        "cache": "starlet caches cold per tile; OS file cache warmed once",
+        "cpu_load_at_start_percent": cpu_load, "cpu_count": psutil.cpu_count(),
+        "python": platform.python_version(), "platform": platform.platform(),
+    }
+    (Path(args.output).parent / "run.json").write_text(json.dumps(info, indent=2))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="built dataset folder (contains parquet_tiles/)")
     ap.add_argument("--runs", type=int, default=3)
-    ap.add_argument("--tiles", type=Path, default=HERE / "tiles.csv")
-    ap.add_argument("--output", type=Path, default=HERE / "results_python.csv")
+    ap.add_argument("--name", required=True, help="benchmark name: reads <name>/tiles.csv, writes <name>/results_python.csv")
+    ap.add_argument("--tiles", type=Path, help="override the tile list (default <name>/tiles.csv)")
+    ap.add_argument("--output", type=Path, help="override the results file (default <name>/results_python.csv)")
     ap.add_argument("--verify", action="store_true",
                     help="also run production generate_tile_ex and require byte-identical tiles")
     args = ap.parse_args()
     if args.runs < 1:
         ap.error("--runs must be at least 1")
 
+    folder = HERE / args.name
+    args.tiles = args.tiles or folder / "tiles.csv"
+    args.output = args.output or folder / "results_python.csv"
     parquet_dir = Path(args.dataset) / "parquet_tiles"
     with args.tiles.open(newline="") as fh:
         tiles = [(int(r["z"]), int(r["x"]), int(r["y"])) for r in csv.DictReader(fh)]
     for f in parquet_dir.glob("*.parquet"):          # warm the OS file cache once
         f.read_bytes()
-    print(f"{len(tiles)} tiles, {args.runs} runs; CPU load {psutil.cpu_percent(interval=1.0):.0f}%", flush=True)
+    cpu_load = psutil.cpu_percent(interval=1.0)
+    print(f"{len(tiles)} tiles, {args.runs} runs; CPU load {cpu_load:.0f}%", flush=True)
+    write_run_info(args, len(tiles), cpu_load)
 
     out = args.output
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["run", "z", "x", "y", "read_ms", "pick_ms",
-                    "records_read", "records_in_tile", "full", "dots",
+                    "records_read", "bytes_read", "records_in_tile", "full", "dots",
                     "generation_ms", "features", "tile_bytes",
                     "decode_ms", "transform_ms", "encode_ms"])
         for run in range(1, args.runs + 1):
@@ -210,6 +249,7 @@ def main():
                 staged_tile, staged_features = encode_tile(frame, source, selection, decoded, transformed)
                 encode_ms = (time.perf_counter() - start) * 1000
                 full, dots = len(selection[0]), len(selection[1])
+                bytes_read = bytes_read_of(index, cache, frame)                     # outside the timers
 
                 generation_ms = ""
                 if args.verify:                                # optional: compare with production
@@ -226,7 +266,7 @@ def main():
                         raise RuntimeError(f"Benchmark output differs from production for tile {z}/{x}/{y}")
 
                 w.writerow([run, z, x, y, round(read_ms, 6), round(pick_ms, 6),
-                            records_read, records_in_tile, full, dots,
+                            records_read, bytes_read, records_in_tile, full, dots,
                             generation_ms, staged_features, len(staged_tile),
                             round(decode_ms, 6), round(transform_ms, 6), round(encode_ms, 6)])
                 fh.flush()  # outside timers: preserve each verified result
