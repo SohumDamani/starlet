@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import date, datetime, time
 from time import perf_counter
 from typing import Optional
 
@@ -10,6 +11,7 @@ import json
 import logging
 import os
 import re
+import numpy as np
 
 from flask import Flask, Response, render_template, send_from_directory, request
 from flask_cors import CORS
@@ -20,6 +22,17 @@ from .tiler.tiler import VectorTiler
 from .download_service import DatasetFeatureService
 
 logger = logging.getLogger(__name__)
+
+
+def _json_attribute(value):
+    """Preserve numeric and nested attributes returned by NumPy/Pandas."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (date, datetime, time)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _parse_attributes_param(value: str | None) -> tuple[str, ...] | None:
@@ -272,7 +285,10 @@ def create_app(
             sample_record = feature_service.get_sample_record(dataset, mbr_string, include_geometry=False)
             if not sample_record:
                 return {"error": "No matching record found"}, 404
-            return json.dumps(sample_record, indent=2)
+            return Response(
+                json.dumps(sample_record, indent=2, default=_json_attribute),
+                mimetype="application/json",
+            )
         except ValueError as e:
             return {"error": str(e)}, 400
         except FileNotFoundError as e:
@@ -305,10 +321,16 @@ def create_app(
 
             if rust_engine.available() and _rust_supports_dataset(str(dataset_path)):
                 hits = rust_engine.query(dataset_path, mbr, limit=limit)
-                return Response(json.dumps({"features": hits}), mimetype="application/json")
+                return Response(
+                    json.dumps({"features": hits}, default=_json_attribute),
+                    mimetype="application/json",
+                )
             sample = feature_service.get_sample_record(dataset, mbr_string, include_geometry=False)
             hits = [{"properties": sample.get("properties", sample)}] if sample else []
-            return Response(json.dumps({"features": hits}), mimetype="application/json")
+            return Response(
+                json.dumps({"features": hits}, default=_json_attribute),
+                mimetype="application/json",
+            )
         except FileNotFoundError as e:
             return {"error": str(e)}, 404
         except Exception as e:
@@ -326,7 +348,10 @@ def create_app(
             sample_record = feature_service.get_sample_record(dataset, mbr_string, include_geometry=True)
             if not sample_record:
                 return {"error": "No matching record found"}, 404
-            return json.dumps(sample_record, indent=2)
+            return Response(
+                json.dumps(sample_record, indent=2, default=_json_attribute),
+                mimetype="application/json",
+            )
         except ValueError as e:
             return {"error": str(e)}, 400
         except FileNotFoundError as e:

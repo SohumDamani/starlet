@@ -9,8 +9,11 @@ Tests cover:
 - CORS headers
 """
 import json
-import pytest
+from datetime import date
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 from starlet._internal.server.app import create_app
 
@@ -257,6 +260,69 @@ class TestFeatureDownload:
         response = client.get('/datasets/test_dataset/features.invalid')
         # Should return error
         assert response.status_code in [400, 404, 500]
+
+
+class TestRecordAttributes:
+    @pytest.mark.parametrize('endpoint', ['sample.json', 'sample.geojson'])
+    def test_sample_endpoints_serialize_numpy_attributes(self, tmp_path, monkeypatch, endpoint):
+        from starlet._internal.server.download_service import DatasetFeatureService
+
+        (tmp_path / 'sample').mkdir()
+        props = {'id': np.int64(123), 'tags': {'levels': np.array([1, 2])}}
+
+        def sample(*args, include_geometry=False, **kwargs):
+            if include_geometry:
+                return {'type': 'Feature', 'properties': props,
+                        'geometry': {'type': 'Point', 'coordinates': [0.5, 0.5]}}
+            return props
+
+        monkeypatch.setattr(DatasetFeatureService, 'get_sample_record', sample)
+        client = create_app(str(tmp_path), log_level='ERROR').test_client()
+        response = client.get(f'/datasets/sample/features/{endpoint}?mbr=0,0,1,1')
+        assert response.status_code == 200
+        assert response.mimetype == 'application/json'
+        data = response.get_json()
+        assert data.get('properties', data) == {'id': 123, 'tags': {'levels': [1, 2]}}
+
+    @pytest.mark.parametrize('use_rust', [False, True])
+    def test_click_lookup_preserves_numpy_and_nested_attributes(self, tmp_path, monkeypatch, use_rust):
+        from starlet._internal.mvt import rust_engine, mvt_generator
+        from starlet._internal.server.download_service import DatasetFeatureService
+
+        (tmp_path / 'sample').mkdir()
+        props = {'id': np.int64(123), 'rating': np.float32(2.5),
+                 'active': np.bool_(True), 'tags': {'levels': np.array([1, 2])},
+                 'date': date(2026, 10, 18)}
+        monkeypatch.setattr(rust_engine, 'available', lambda: use_rust)
+        monkeypatch.setattr(mvt_generator, '_rust_supports_dataset', lambda _: True)
+        monkeypatch.setattr(rust_engine, 'query', lambda *a, **k: [{'properties': props}])
+        monkeypatch.setattr(DatasetFeatureService, 'get_sample_record', lambda *a, **k: props)
+        client = create_app(str(tmp_path), log_level='ERROR').test_client()
+        response = client.get('/datasets/sample/features/at.json?mbr=0,0,1,1')
+        assert response.status_code == 200
+        assert response.get_json()['features'][0]['properties'] == {
+            'id': 123, 'rating': 2.5, 'active': True,
+            'tags': {'levels': [1, 2]}, 'date': '2026-10-18'}
+
+    def test_empty_lookup_is_distinct_from_failure(self, tmp_path, monkeypatch):
+        from starlet._internal.mvt import rust_engine
+        from starlet._internal.server.download_service import DatasetFeatureService
+
+        (tmp_path / 'sample').mkdir()
+        monkeypatch.setattr(rust_engine, 'available', lambda: False)
+        monkeypatch.setattr(DatasetFeatureService, 'get_sample_record', lambda *a, **k: None)
+        client = create_app(str(tmp_path), log_level='ERROR').test_client()
+        url = '/datasets/sample/features/at.json?mbr=0,0,1,1'
+        response = client.get(url)
+        assert response.status_code == 200
+        assert response.get_json() == {'features': []}
+
+        def fail(*args, **kwargs):
+            raise RuntimeError('Lookup failed')
+        monkeypatch.setattr(DatasetFeatureService, 'get_sample_record', fail)
+        response = client.get(url)
+        assert response.status_code == 500
+        assert 'error' in response.get_json()
 
 
 class TestStaticFileServing:

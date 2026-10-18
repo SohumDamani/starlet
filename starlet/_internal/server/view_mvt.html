@@ -492,7 +492,7 @@ function renderRecords(records) {
   return records.slice(0, 5).map((rec, i) => {
     const rows = Object.entries(rec.properties || {}).map(
       ([k, v]) => `<tr><th style="text-align:left;padding-right:6px;vertical-align:top">${escapeHtml(k)}</th>` +
-                  `<td style="word-break:break-all">${escapeHtml(v)}</td></tr>`
+                  `<td style="word-break:break-all">${escapeHtml(v !== null && typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`
     ).join("");
     const head = records.length > 1 ? `<div style="font-weight:bold;margin-top:${i ? 6 : 0}px">Record ${i + 1} of ${records.length}</div>` : "";
     return `${head}<table style="font:12px/1.3 sans-serif">${rows || "<tr><td><i>no attributes</i></td></tr>"}</table>`;
@@ -511,6 +511,9 @@ map.on("click", async (e) => {
     const t0 = performance.now();
     const resp = await origFetch(`${window.location.origin}/datasets/${dataset}/features/at.json?mbr=${mbr}&limit=20`);
     const data = await resp.json();
+    if (!resp.ok || data.error) {
+      throw new Error(data.error || `Record lookup failed (HTTP ${resp.status})`);
+    }
     const ms = Math.round(performance.now() - t0);
     const records = data.features || [];
     recordPopup.setHTML(renderRecords(records) + `<div style="color:#888;font:10px sans-serif;margin-top:4px">${ms} ms</div>`);
