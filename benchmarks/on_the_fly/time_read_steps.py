@@ -12,12 +12,14 @@ Cold: a new index and row-group cache per tile. OS file cache: warmed once at th
 """
 import argparse
 import csv
+import gc
 import random
 import time
 from pathlib import Path
 
 import numpy as np
 import psutil
+import pyarrow as pa
 
 from starlet._internal.config import config_value
 from starlet._internal.mvt.fast_tile import BBOX_COLS, RowGroupCache, TileFrame, _crc32_array
@@ -72,13 +74,14 @@ def read_steps(index, cache, frame):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, help="built dataset folder (contains parquet_tiles/)")
-    ap.add_argument("--name", required=True, help="benchmark name: reads <name>/tiles.csv")
+    ap.add_argument("--name", required=True, help="benchmark name: reads <name>/tiles.csv, writes <name>/results_read_steps.csv")
+    ap.add_argument("--tiles", type=Path, help="use this tile list instead of <name>/tiles.csv")
     ap.add_argument("--runs", type=int, default=1)
     args = ap.parse_args()
 
     folder = HERE / args.name
     parquet_dir = Path(args.dataset) / "parquet_tiles"
-    with open(folder / "tiles.csv", newline="") as fh:
+    with open(args.tiles or folder / "tiles.csv", newline="") as fh:
         tiles = [(int(r["z"]), int(r["x"]), int(r["y"])) for r in csv.DictReader(fh)]
     for f in parquet_dir.glob("*.parquet"):          # warm the OS file cache once
         f.read_bytes()
@@ -98,6 +101,10 @@ def main():
                 t, records_read, records_in_tile = read_steps(index, cache, frame)
                 w.writerow([run, z, x, y, *[round(t[s], 3) for s in STEPS], round(sum(t.values()), 3),
                             records_read, records_in_tile])
+                fh.flush()
+                del index, cache, frame                  # free this tile's files and footers (outside the timer)
+                gc.collect()
+                pa.default_memory_pool().release_unused()
                 if n % 50 == 0:
                     print(f"run {run}: {n}/{len(order)} tiles", flush=True)
     print(f"saved {out}")
