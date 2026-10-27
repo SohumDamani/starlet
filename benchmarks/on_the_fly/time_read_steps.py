@@ -8,7 +8,8 @@ RowGroupCache.row_group (fast_tile.py:286-297) copied in, so each step can be ti
   bbox    the 4 bbox columns -> numpy
   crc     crc32 of every geometry                   (only with crc32 priority; --no-crc removes it)
   filter  per-record bbox overlap
-Cold: a new index and row-group cache per tile. OS file cache: warmed once at the start.
+Cold (default): a new index and row-group cache per tile. --warm: one index and footer cache for all tiles, like the
+running server (row groups are still read for every tile). OS file cache: warmed once at the start.
 """
 import argparse
 import csv
@@ -84,6 +85,8 @@ def main():
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--no-crc", action="store_true",
                     help="mvt.crc_priority = false: no WKB-to-bytes copy and no crc32 (the wkb and crc steps are gone)")
+    ap.add_argument("--warm", action="store_true",
+                    help="keep one index and footer cache across tiles, like the running server")
     args = ap.parse_args()
 
     if args.no_crc:
@@ -99,7 +102,11 @@ def main():
         tiles = [(int(r["z"]), int(r["x"]), int(r["y"])) for r in csv.DictReader(fh)]
     for f in parquet_dir.glob("*.parquet"):          # warm the OS file cache once
         f.read_bytes()
-    print(f"{len(tiles)} tiles, {args.runs} run(s), crc priority {'on' if use_crc else 'off'}; "
+    if args.warm:                                    # shared by every tile, like the server's cached index
+        index = ParquetIndex(parquet_dir)
+        cache = RowGroupCache(index, int(config_value("mvt", "row_group_cache")))
+    print(f"{len(tiles)} tiles, {args.runs} run(s), crc priority {'on' if use_crc else 'off'}, "
+          f"{'warm' if args.warm else 'cold'}; "
           f"CPU load {psutil.cpu_percent(interval=1.0):.0f}%", flush=True)
 
     out = folder / "results_read_steps.csv"
@@ -110,14 +117,17 @@ def main():
             order = tiles[:]
             random.Random(run).shuffle(order)
             for n, (z, x, y) in enumerate(order, 1):
-                index = ParquetIndex(parquet_dir)                                   # cold
-                cache = RowGroupCache(index, int(config_value("mvt", "row_group_cache")))   # cold
+                if not args.warm:
+                    index = ParquetIndex(parquet_dir)                               # cold
+                    cache = RowGroupCache(index, int(config_value("mvt", "row_group_cache")))   # cold
                 frame = TileFrame(z, x, y, EXTENT, BUFFER)
                 t, records_read, records_in_tile = read_steps(index, cache, frame, use_crc)
                 w.writerow([run, z, x, y, *[round(t[s], 3) for s in steps], round(sum(t.values()), 3),
                             records_read, records_in_tile])
                 fh.flush()
-                del index, cache, frame                  # free this tile's files and footers (outside the timer)
+                if not args.warm:
+                    del index, cache                     # free this tile's files and footers (outside the timer)
+                del frame
                 gc.collect()
                 pa.default_memory_pool().release_unused()
                 if n % 50 == 0:
