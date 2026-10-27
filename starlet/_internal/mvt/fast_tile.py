@@ -286,13 +286,16 @@ class RowGroupCache:
         pf, geom_col, has_bbox, _, attrs, _ = self.file_info(path)
         columns = [geom_col] + (list(BBOX_COLS) if has_bbox else []) + attrs
         table = pf.read_row_group(rg, columns=columns)
-        wkb = table[geom_col].to_pylist()
+        # mvt.crc_priority = false: ties in selection go to the earliest row, so no WKB bytes are copied for the crc32
+        use_crc = bool(config_value("mvt", "crc_priority", True))
+        wkb = table[geom_col].to_pylist() if use_crc or not has_bbox else None
         if has_bbox:
             bb = [table[c].to_numpy(zero_copy_only=False).astype(np.float64) for c in BBOX_COLS]
         else:
             bounds = shapely.bounds(shapely.from_wkb(wkb, on_invalid="ignore"))
             bb = [bounds[:, 0], bounds[:, 1], bounds[:, 2], bounds[:, 3]]
-        entry = (table, bb[0], bb[1], bb[2], bb[3], _crc32_array(wkb))
+        crc = _crc32_array(wkb) if use_crc else np.zeros(table.num_rows, dtype=np.uint32)
+        entry = (table, bb[0], bb[1], bb[2], bb[3], crc)
         with self._lock:
             self._rgs[key] = entry
             self._rgs.move_to_end(key)

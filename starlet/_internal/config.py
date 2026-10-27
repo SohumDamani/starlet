@@ -38,6 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "tile_attributes": "all",
         "simplify_tolerance": "auto",
         "row_group_cache": 256,
+        "crc_priority": True,
         "python_pyramid": "pull",
         "batch_row_group_cache": 32,
         "push_max_tiles": 1024,
