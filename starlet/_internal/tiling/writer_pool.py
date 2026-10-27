@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import shapely
 from shapely import from_wkb
@@ -34,6 +35,22 @@ logger = logging.getLogger(__name__)
 # tile server can skip row groups/rows at read time.
 BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
 DEFAULT_ROW_GROUP_SIZE = 16384
+DEFAULT_ROW_GROUP_BYTES = 2 * 1024 * 1024   # uncompressed
+
+
+def _row_group_starts(tbl: pa.Table, geom_col: str, max_rows: int, max_bytes: int) -> List[int]:
+    """Row positions where a new row group starts: a group closes once it reaches
+    ``max_rows`` rows or ``max_bytes`` uncompressed bytes, whichever comes first."""
+    geom = pc.binary_length(tbl[geom_col]).to_numpy(zero_copy_only=False).astype(np.float64)
+    per_row = geom + (tbl.nbytes - tbl[geom_col].nbytes) / tbl.num_rows
+    starts, size, rows = [0], 0.0, 0
+    for i, b in enumerate(per_row):
+        size += b
+        rows += 1
+        if (size >= max_bytes or rows >= max_rows) and i + 1 < tbl.num_rows:
+            starts.append(i + 1)
+            size, rows = 0.0, 0
+    return starts
 
 
 def _append_bbox_columns(tbl: pa.Table, geom_col: str) -> pa.Table:
@@ -283,10 +300,14 @@ def _finalize_one_tile(
         write_args.setdefault("compression", config.compression)
     # Bounded, spatially-coherent row groups make the covering-column statistics
     # a tight read-time filter; only meaningful alongside the covering columns.
-    if config.covering_bbox and combined.num_rows:
-        write_args.setdefault("row_group_size", min(combined.num_rows, DEFAULT_ROW_GROUP_SIZE))
-
-    pq.write_table(combined, out_path, **write_args)
+    if config.covering_bbox and combined.num_rows and "row_group_size" not in write_args:
+        starts = _row_group_starts(combined, config.geom_col, DEFAULT_ROW_GROUP_SIZE, DEFAULT_ROW_GROUP_BYTES)
+        ends = starts[1:] + [combined.num_rows]
+        with pq.ParquetWriter(out_path, combined.schema, **write_args) as w:
+            for a, b in zip(starts, ends):
+                w.write_table(combined.slice(a, b - a), row_group_size=b - a)   # one row group per slice
+    else:
+        pq.write_table(combined, out_path, **write_args)
     return out_path
 
 
