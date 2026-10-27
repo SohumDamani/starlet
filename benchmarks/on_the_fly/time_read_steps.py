@@ -1,12 +1,12 @@
 """Time the steps inside READ for every benchmark tile (Read only, no later stages).
 
 Same work as fast_tile.generate_tile_ex's read loop (fast_tile.py:374-393) with
-RowGroupCache.row_group (fast_tile.py:286-295) copied in, so each step can be timed:
+RowGroupCache.row_group (fast_tile.py:286-297) copied in, so each step can be timed:
   find    files by name + row groups by footer min/max
   load    read_row_group: all rows, geometry + bbox + attribute columns (decompress -> Arrow)
-  wkb     every geometry -> Python bytes
+  wkb     every geometry -> Python bytes            (only with crc32 priority; --no-crc removes it)
   bbox    the 4 bbox columns -> numpy
-  crc     crc32 of every geometry
+  crc     crc32 of every geometry                   (only with crc32 priority; --no-crc removes it)
   filter  per-record bbox overlap
 Cold: a new index and row-group cache per tile. OS file cache: warmed once at the start.
 """
@@ -21,19 +21,22 @@ import numpy as np
 import psutil
 import pyarrow as pa
 
-from starlet._internal.config import config_value
+from starlet._internal.config import config_value, get_loaded_config, set_loaded_config
 from starlet._internal.mvt.fast_tile import BBOX_COLS, RowGroupCache, TileFrame, _crc32_array
 from starlet._internal.server.tiler.parquet_index import ParquetIndex
 
 HERE = Path(__file__).resolve().parent
 EXTENT = int(config_value("mvt", "extent"))
 BUFFER = int(config_value("mvt", "buffer"))
-STEPS = ["find", "load", "wkb", "bbox", "crc", "filter"]
 
 
-def read_steps(index, cache, frame):
+def step_names(use_crc):
+    return ["find", "load", "wkb", "bbox", "crc", "filter"] if use_crc else ["find", "load", "bbox", "filter"]
+
+
+def read_steps(index, cache, frame, use_crc):
     """Returns ({step: ms}, records read, records in tile)."""
-    t = dict.fromkeys(STEPS, 0.0)
+    t = dict.fromkeys(step_names(use_crc), 0.0)
     qx0, qy0, qx1, qy1 = frame.query_lonlat
     records_read = records_in_tile = 0
 
@@ -49,17 +52,19 @@ def read_steps(index, cache, frame):
             table = pf.read_row_group(rg, columns=columns)                          # b. load the row group
             t["load"] += time.perf_counter() - s
 
-            s = time.perf_counter()
-            wkb = table[geom_col].to_pylist()                                      # c. geometry -> Python bytes
-            t["wkb"] += time.perf_counter() - s
+            if use_crc:
+                s = time.perf_counter()
+                wkb = table[geom_col].to_pylist()                                  # c. geometry -> Python bytes
+                t["wkb"] += time.perf_counter() - s
 
             s = time.perf_counter()
             a, b, c, d = [table[col].to_numpy(zero_copy_only=False).astype(np.float64) for col in BBOX_COLS]  # d. bbox -> numpy
             t["bbox"] += time.perf_counter() - s
 
-            s = time.perf_counter()
-            _crc32_array(wkb)                                                      # e. crc32 of every geometry
-            t["crc"] += time.perf_counter() - s
+            if use_crc:
+                s = time.perf_counter()
+                _crc32_array(wkb)                                                  # e. crc32 of every geometry
+                t["crc"] += time.perf_counter() - s
 
             s = time.perf_counter()
             hit = (c >= qx0) & (a <= qx1) & (d >= qy0) & (b <= qy1)                # f. records that overlap
@@ -77,7 +82,16 @@ def main():
     ap.add_argument("--name", required=True, help="benchmark name: reads <name>/tiles.csv, writes <name>/results_read_steps.csv")
     ap.add_argument("--tiles", type=Path, help="use this tile list instead of <name>/tiles.csv")
     ap.add_argument("--runs", type=int, default=1)
+    ap.add_argument("--no-crc", action="store_true",
+                    help="mvt.crc_priority = false: no WKB-to-bytes copy and no crc32 (the wkb and crc steps are gone)")
     args = ap.parse_args()
+
+    if args.no_crc:
+        config = get_loaded_config()
+        config.setdefault("mvt", {})["crc_priority"] = False
+        set_loaded_config(config)
+    use_crc = bool(config_value("mvt", "crc_priority", True))
+    steps = step_names(use_crc)
 
     folder = HERE / args.name
     parquet_dir = Path(args.dataset) / "parquet_tiles"
@@ -85,12 +99,13 @@ def main():
         tiles = [(int(r["z"]), int(r["x"]), int(r["y"])) for r in csv.DictReader(fh)]
     for f in parquet_dir.glob("*.parquet"):          # warm the OS file cache once
         f.read_bytes()
-    print(f"{len(tiles)} tiles, {args.runs} run(s); CPU load {psutil.cpu_percent(interval=1.0):.0f}%", flush=True)
+    print(f"{len(tiles)} tiles, {args.runs} run(s), crc priority {'on' if use_crc else 'off'}; "
+          f"CPU load {psutil.cpu_percent(interval=1.0):.0f}%", flush=True)
 
     out = folder / "results_read_steps.csv"
     with open(out, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["run", "z", "x", "y", *[f"{s}_ms" for s in STEPS], "read_ms", "records_read", "records_in_tile"])
+        w.writerow(["run", "z", "x", "y", *[f"{s}_ms" for s in steps], "read_ms", "records_read", "records_in_tile"])
         for run in range(1, args.runs + 1):
             order = tiles[:]
             random.Random(run).shuffle(order)
@@ -98,8 +113,8 @@ def main():
                 index = ParquetIndex(parquet_dir)                                   # cold
                 cache = RowGroupCache(index, int(config_value("mvt", "row_group_cache")))   # cold
                 frame = TileFrame(z, x, y, EXTENT, BUFFER)
-                t, records_read, records_in_tile = read_steps(index, cache, frame)
-                w.writerow([run, z, x, y, *[round(t[s], 3) for s in STEPS], round(sum(t.values()), 3),
+                t, records_read, records_in_tile = read_steps(index, cache, frame, use_crc)
+                w.writerow([run, z, x, y, *[round(t[s], 3) for s in steps], round(sum(t.values()), 3),
                             records_read, records_in_tile])
                 fh.flush()
                 del index, cache, frame                  # free this tile's files and footers (outside the timer)
