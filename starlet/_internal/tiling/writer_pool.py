@@ -36,18 +36,37 @@ logger = logging.getLogger(__name__)
 BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
 DEFAULT_ROW_GROUP_SIZE = 16384
 DEFAULT_ROW_GROUP_BYTES = 2 * 1024 * 1024   # uncompressed
+# The footer holds one ~250 B entry per column per row group (measured ~235 B); pyarrow cannot read a footer above 100 MB.
+FOOTER_ENTRY_BYTES = 250
+FOOTER_BUDGET_BYTES = 16 * 1024 * 1024
+
+
+def _leaf_columns(t: pa.DataType) -> int:
+    """Parquet leaf columns under one Arrow type: the footer has one entry per leaf, not per top-level column."""
+    if pa.types.is_struct(t):
+        return sum(_leaf_columns(t.field(i).type) for i in range(t.num_fields))
+    if pa.types.is_map(t):
+        return _leaf_columns(t.key_type) + _leaf_columns(t.item_type)
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+        return _leaf_columns(t.value_type)
+    return 1
 
 
 def _row_group_starts(tbl: pa.Table, geom_col: str, max_rows: int, max_bytes: int) -> List[int]:
     """Row positions where a new row group starts: a group closes once it reaches
-    ``max_rows`` rows or ``max_bytes`` uncompressed bytes, whichever comes first."""
+    ``max_rows`` rows or ``max_bytes`` uncompressed bytes, whichever comes first,
+    but never before ``min_rows``, which keeps the file footer within FOOTER_BUDGET_BYTES
+    (wide tables get bigger row groups)."""
     geom = pc.binary_length(tbl[geom_col]).to_numpy(zero_copy_only=False).astype(np.float64)
     per_row = geom + (tbl.nbytes - tbl[geom_col].nbytes) / tbl.num_rows
+    leaves = sum(_leaf_columns(f.type) for f in tbl.schema)
+    min_rows = math.ceil(tbl.num_rows * leaves * FOOTER_ENTRY_BYTES / FOOTER_BUDGET_BYTES)
+    max_rows = max(max_rows, min_rows)
     starts, size, rows = [0], 0.0, 0
     for i, b in enumerate(per_row):
         size += b
         rows += 1
-        if (size >= max_bytes or rows >= max_rows) and i + 1 < tbl.num_rows:
+        if ((size >= max_bytes and rows >= min_rows) or rows >= max_rows) and i + 1 < tbl.num_rows:
             starts.append(i + 1)
             size, rows = 0.0, 0
     return starts
