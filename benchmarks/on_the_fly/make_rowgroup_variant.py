@@ -42,7 +42,9 @@ def main():
     size = ap.add_mutually_exclusive_group(required=True)
     size.add_argument("--rows", type=int)
     size.add_argument("--mb", type=float)
+    ap.add_argument("--page-rows", type=int, help="write a page index, with at most this many rows per page")
     args = ap.parse_args()
+    pages = {"write_page_index": True, "max_rows_per_page": args.page_rows} if args.page_rows else {}
 
     out_dir = Path(args.out) / "parquet_tiles"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -50,10 +52,10 @@ def main():
     for f in sorted((Path(args.dataset) / "parquet_tiles").glob("*.parquet")):
         table = pq.read_table(f)
         if args.rows:
-            pq.write_table(table, out_dir / f.name, compression="zstd", row_group_size=args.rows)
+            pq.write_table(table, out_dir / f.name, compression="zstd", row_group_size=args.rows, **pages)
         else:
             starts = cuts_by_mb(table, args.mb) + [table.num_rows]
-            with pq.ParquetWriter(out_dir / f.name, table.schema, compression="zstd") as w:
+            with pq.ParquetWriter(out_dir / f.name, table.schema, compression="zstd", **pages) as w:
                 for a, b in zip(starts[:-1], starts[1:]):
                     w.write_table(table.slice(a, b - a), row_group_size=b - a)   # one row group per slice
         n_groups += pq.read_metadata(out_dir / f.name).num_row_groups

@@ -5,6 +5,7 @@
 3. Save <name>/points.csv (one row per point) and <name>/tiles.csv (one row per unique tile).
 
 Only the picked records are read, so it also works on very large datasets.
+--from-points: skip 1-2 and reuse the points already in <name>/points.csv (lon/lat), e.g. to add zoom levels.
 """
 import argparse
 import csv
@@ -30,8 +31,43 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--zmin", type=int, default=2)
     ap.add_argument("--zmax", type=int, default=10)
+    ap.add_argument("--from-points", action="store_true",
+                    help="reuse <name>/points.csv instead of sampling again (same points, other zoom levels)")
     args = ap.parse_args()
+    out = HERE / args.name
+    if args.from_points:
+        with open(out / "points.csv", newline="") as f:
+            points = list(csv.DictReader(f))
+        lonlat = shapely.points([float(p["lon"]) for p in points], [float(p["lat"]) for p in points])
+        mercator, _ = reproject_geometries(lonlat, WGS84_CRS, WEB_MERCATOR_CRS)
+    else:
+        points, mercator = sample_points(args)
+        out.mkdir(exist_ok=True)
+        with open(out / "points.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(points[0]))
+            w.writeheader()
+            w.writerows(points)
 
+    tiles = defaultdict(list)
+    for p, m in zip(points, mercator):
+        for z in range(args.zmin, args.zmax + 1):
+            x, y, _, _ = mercator_bounds_to_tile_range(z, m.x, m.y, m.x, m.y)
+            tiles[(z, x, y)].append(p["point_id"])
+
+    with open(out / "tiles.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["z", "x", "y", "n_points", "point_ids"])
+        for (z, x, y), ids in sorted(tiles.items()):
+            w.writerow([z, x, y, len(ids), " ".join(ids)])
+
+    print(f"{len(points)} points -> {len(tiles)} unique tiles")
+    for z in range(args.zmin, args.zmax + 1):
+        print(f"  zoom {z:2d}: {sum(1 for t in tiles if t[0] == z):3d} tiles")
+    print(f"saved {out / 'tiles.csv'}")
+
+
+def sample_points(args):
+    """Steps 1-3: N random records and a point inside each; returns (point rows, points in Web Mercator)."""
     # 1. every row has a global position: (file, row) from the footer row counts
     files = sorted((Path(args.dataset) / "parquet_tiles").glob("*.parquet"))
     counts = [pq.read_metadata(f).num_rows for f in files]
@@ -63,32 +99,10 @@ def main():
     inside = shapely.point_on_surface(shapes)
     mercator, _ = reproject_geometries(inside, picked[0][3], WEB_MERCATOR_CRS)
 
-    points, tiles = [], defaultdict(list)
-    for i, ((file, row, wkb, _), shape, p, m) in enumerate(zip(picked, shapes, inside, mercator)):
-        point_id = f"P{i + 1:03d}"
-        points.append({"point_id": point_id, "file": file, "row": row, "lon": p.x, "lat": p.y,
-                       "geom_type": shape.geom_type, "priority": feature_priority(wkb)})
-        for z in range(args.zmin, args.zmax + 1):
-            x, y, _, _ = mercator_bounds_to_tile_range(z, m.x, m.y, m.x, m.y)
-            tiles[(z, x, y)].append(point_id)
-
-    # 4. save
-    out = HERE / args.name
-    out.mkdir(exist_ok=True)
-    with open(out / "points.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(points[0]))
-        w.writeheader()
-        w.writerows(points)
-    with open(out / "tiles.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["z", "x", "y", "n_points", "point_ids"])
-        for (z, x, y), ids in sorted(tiles.items()):
-            w.writerow([z, x, y, len(ids), " ".join(ids)])
-
-    print(f"{len(points)} points -> {len(tiles)} unique tiles")
-    for z in range(args.zmin, args.zmax + 1):
-        print(f"  zoom {z:2d}: {sum(1 for t in tiles if t[0] == z):3d} tiles")
-    print(f"saved {out / 'points.csv'} and {out / 'tiles.csv'}")
+    points = [{"point_id": f"P{i + 1:03d}", "file": file, "row": row, "lon": p.x, "lat": p.y,
+               "geom_type": shape.geom_type, "priority": feature_priority(wkb)}
+              for i, ((file, row, wkb, _), shape, p) in enumerate(zip(picked, shapes, inside))]
+    return points, mercator
 
 
 if __name__ == "__main__":
