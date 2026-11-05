@@ -1,0 +1,25 @@
+[package]
+name = "starlet-read"
+version = "0.1.0"
+edition = "2021"
+description = "Read Parquet row groups in parallel for starlet's Read step, separate from starlet-core"
+license = "MIT"
+
+[lib]
+name = "starlet_read"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-arrow = "0.19"
+arrow-array = "59"
+arrow-schema = "59"
+arrow-select = "59"
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap"] }
+rayon = "1"
+mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
